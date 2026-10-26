@@ -1,0 +1,73 @@
+{
+    "api_key":  "",
+    "model":  "deepseek-flash",
+    "system_prompt":  "你是一个通过微信聊天的 AI 助手。回答简洁、口语化，纯文本，不要用 Markdown 标题和代码块。不确定的事情要直说。",
+    "max_tokens":  800,
+    "temperature":  1.0,
+    "timeout":  60,
+    "history_turns":  6,
+    "session_ttl":  1800,
+    "group_mode":  "at",
+    "proactive_enabled":  false,
+    "proactive_ids":  [
+
+                      ],
+    "proactive_chance":  0.15,
+    "proactive_min_gap":  600,
+    "proactive_max_per_hour":  3,
+    "my_names":  [
+
+                 ],
+    "whitelist":  [
+
+                  ],
+    "blacklist":  [
+
+                  ],
+    "rate_limit":  50,
+    "reply_prefix":  "",
+    "reply_split":  true,
+    "reply_split_max":  5,
+    "dry_run":  false,
+    "log_file":  "wxbot.log",
+    "system_prompt_file":  "persona.txt",
+    "sticker_dir":  "stickers",
+    "sticker_max":  1,
+    "image_paste_wait":  3,
+    "wx_debug":  false,
+    "memory_file":  "memory.json",
+    "developer_ids":  [
+
+                      ],
+    "memory_traits":  30,
+    "memory_recall":  6,
+    "memory_recall_chars":  400,
+    "memory_recent":  3,
+    "summary_enabled":  true,
+    "summary_after":  600,
+    "summary_keep":  10,
+    "summary_inject":  2,
+    "reflect_enabled":  true,
+    "reflect_hours":  24,
+    "reflect_active_days":  7,
+    "vision_enabled":  true,
+    "vision_model":  "deepseek-flash",
+    "vision_detail":  "low",
+    "vision_max_per_hour":  10,
+    "vision_image_ttl":  60,
+    "vision_max_side":  1300,
+    "rhythm_profile":  "off",
+    "thinking":  false,
+    "web_search_enabled":  true,
+    "web_search_count":  3,
+    "web_search_per_hour":  6,
+    "web_search_rounds":  2,
+    "memory_moments":  6,
+    "kaomoji_enabled":  true,
+    "kaomoji_rate":  0.5,
+    "kaomoji_cooldown":  300,
+    "log_max_bytes":  2097152,
+    "log_backups":  5,
+    "image_keep_days":  7,
+    "image_keep_max":  200
+}

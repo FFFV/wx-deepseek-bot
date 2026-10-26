@@ -1,0 +1,13 @@
+# 统一换行，避免 Windows 用户拉下来后脚本跑不了
+* text=auto eol=lf
+
+# 双击运行的启动脚本必须是 CRLF，否则 cmd/powershell 会报错
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制，别做换行转换
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+*.webp binary

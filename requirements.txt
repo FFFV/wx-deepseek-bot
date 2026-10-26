@@ -1,0 +1,7 @@
+# 运行必需
+wechatauto-replica>=1.2.7
+Pillow>=10.0
+
+# 可选：微信 4.x 的图片常是 .wxgf（HEVC 容器），识图前要转成 jpg。
+# 装了会自动发现 ffmpeg；不装则遇到 .wxgf 时只能跳过（不影响文字聊天）。
+# imageio-ffmpeg>=0.4.9

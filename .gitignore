@@ -1,0 +1,29 @@
+# 依赖（用 pip install -r requirements.txt，不需要这个目录）
+vendor/
+
+# 本地配置（含 API Key、白名单，别提交）
+config.json
+
+# 自己用的那份人设（仓库里带的是通用示例 persona.txt）
+persona.local.txt
+persona.*.txt
+
+# 运行产物
+wxbot.log
+wxbot.log.*
+wechatauto_logs/
+__pycache__/
+*.pyc
+
+# 对话记忆（含聊天内容，别提交）
+memory.json
+memory.json.tmp
+memory.json.bak-*
+
+# 识图时落盘的临时图片
+_images/
+
+# 表情包：只提交说明和示例图，自己塞的网图不进仓库（版权 + 体积）
+stickers/*
+!stickers/说明.txt
+!stickers/示例.jpg
