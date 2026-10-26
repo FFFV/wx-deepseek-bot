@@ -1,4 +1,8 @@
-# 启动器：自动挑一个能用的 Python，然后跑 wx_bot.py
+﻿# 启动器：自动挑一个能用的 Python，然后跑 wx_bot.py
+#
+# ⚠️ 这个文件必须保存成「UTF-8 with BOM」+ CRLF，否则 Windows PowerShell 5.1
+#    会按 ANSI 解码中文，报「字符串缺少终止符」。改完请确认文件头是 EF BB BF。
+#
 # 用法：
 #   .\run.ps1 --check
 #   .\run.ps1 --dry-run
@@ -52,7 +56,7 @@ foreach ($candidate in @(
 
 if (-not $py) {
     Write-Host "找不到 64 位的 Python。请先安装 Python 3.12（64 位）：https://www.python.org/downloads/windows/" -ForegroundColor Yellow
-    Write-Host "然后运行： pip install wechatauto-replica" -ForegroundColor Yellow
+    Write-Host "然后运行： pip install -r requirements.txt" -ForegroundColor Yellow
     exit 1
 }
 
@@ -70,8 +74,8 @@ if (-not (Test-ImportOk $py $pyExtra)) {
         $env:PATH = (Join-Path $vendor 'pywin32_system32') + ';' + $env:PATH
         Write-Host "已挂载本地 vendor 依赖" -ForegroundColor DarkGray
     } else {
-        Write-Host "缺少 wechatauto-replica，正在安装…" -ForegroundColor Yellow
-        & $py @pyExtra -m pip install wechatauto-replica
+        Write-Host "缺少依赖，正在安装…" -ForegroundColor Yellow
+        & $py @pyExtra -m pip install -r (Join-Path $here 'requirements.txt')
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
 }
