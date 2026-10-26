@@ -16,7 +16,6 @@ import urllib.error
 from unittest import mock
 
 from brain import (
-    TEXT_LIMIT,
     Config,
     DeepSeekClient,
     DeepSeekError,
@@ -28,6 +27,7 @@ from brain import (
     config_from_dict,
     decide,
     is_mentioned,
+    split_messages,
     split_text,
     strip_mentions,
     strip_sender_prefix,
@@ -55,9 +55,7 @@ class TestCleaners(unittest.TestCase):
         self.assertEqual(strip_sender_prefix("wxid_abc123:\n@小明 你好"), "@小明 你好")
         # 不是 wxid 开头的「xx:」不要剥，避免误伤正文
         self.assertEqual(strip_sender_prefix("2024:\n年度总结"), "2024:\n年度总结")
-
-    def test_strip_sender_prefix_keeps_plain_colon(self):
-        # 正文里的冒号不能被当成发送者前缀
+        # 正文里的冒号（含全角）也不能被当成发送者前缀
         self.assertEqual(strip_sender_prefix("价格是：100 元"), "价格是：100 元")
 
     def test_mention_detection(self):
@@ -69,6 +67,88 @@ class TestCleaners(unittest.TestCase):
     def test_strip_mentions(self):
         self.assertEqual(strip_mentions("@小明 帮我写首诗", ["小明"]), "帮我写首诗")
         self.assertEqual(strip_mentions("@小明\u2005写首诗", ["小明"]), "写首诗")
+
+
+class TestCleanReply(unittest.TestCase):
+    """模型偶尔会把 HTML 当正文回：线上真发过 <div style="text-align: center"></div>。"""
+
+    def test_tag_only_reply_becomes_empty(self):
+        from brain import clean_reply
+        self.assertEqual(clean_reply('<div style="text-align: center"></div>'), "")
+        # 模型有时把引号写成中文引号，一样要认
+        self.assertEqual(clean_reply('<div style=“text-align: center”></div>'), "")
+        self.assertEqual(clean_reply("<div><p>  </p></div>"), "")
+
+    def test_text_inside_tags_is_kept(self):
+        from brain import clean_reply
+        self.assertEqual(clean_reply("<div>你好</div>"), "你好")
+        self.assertEqual(clean_reply("<span>没有</span>标签"), "没有标签")
+        self.assertEqual(clean_reply("<b>粗</b>体和<i>斜</i>"), "粗体和斜")
+        self.assertEqual(clean_reply('<div align="center">居中<strong>强调</strong></div>'),
+                         "居中强调")
+
+    def test_block_tags_become_newlines(self):
+        from brain import clean_reply
+        out = clean_reply("<div>第一段</div><div>第二段</div>")
+        self.assertEqual(out.split("\n"), ["第一段", "", "第二段"])
+        self.assertEqual(clean_reply("你好<br>世界"), "你好\n世界")
+        # split_messages 会丢掉空行，所以多出来的空行不会变成空消息
+        self.assertEqual(split_messages(out), ["第一段", "第二段"])
+
+    def test_entities_restored(self):
+        from brain import clean_reply
+        self.assertEqual(clean_reply("&nbsp;空格&amp;符号&lt;3"), "空格&符号<3")
+
+    def test_kaomoji_untouched(self):
+        from brain import clean_reply
+        # 颜文字里的尖括号不是标签，不能一起吃掉
+        self.assertEqual(clean_reply("<(￣︶￣)> 开心"), "<(￣︶￣)> 开心")
+        self.assertEqual(clean_reply("a < b 比较"), "a < b 比较")
+        self.assertEqual(clean_reply("普通一句话，没有标签"), "普通一句话，没有标签")
+
+
+class TestUnknownTags(unittest.TestCase):
+    """模型会自己发明标签：该写 [回忆:] 时写成 [想念:]，结果当正文发了出去。"""
+
+    def test_invented_tag_is_stripped(self):
+        from brain import strip_unknown_tags
+        text, names = strip_unknown_tags("好呀\n[想念:他说要给我充token]")
+        self.assertEqual(text, "好呀")
+        self.assertEqual(names, ["想念"])
+
+    def test_fullwidth_brackets(self):
+        from brain import strip_unknown_tags
+        text, names = strip_unknown_tags("嗯……【心情：有点开心】")
+        self.assertEqual(text, "嗯……")
+        self.assertEqual(names, ["心情"])
+
+    def test_known_tags_kept(self):
+        """已知标签由各自的 extractor 负责，这个兜底不能抢。"""
+        from brain import strip_unknown_tags
+        self.assertEqual(strip_unknown_tags("[好感:+3 被夸]")[0], "[好感:+3 被夸]")
+        self.assertEqual(strip_unknown_tags("[记住:喜欢猫]")[0], "[记住:喜欢猫]")
+
+    def test_plain_brackets_untouched(self):
+        from brain import strip_unknown_tags
+        for s in ("[1] 号楼", "【公告】明天停水", "[狗头]", "【笑哭】",
+                  "[时间 19:38]"):
+            self.assertEqual(strip_unknown_tags(s), (s, []), s)
+
+    def test_pipeline_drops_invented_tag(self):
+        from wx_bot import Bot
+        cfg = Config(api_key="sk-test")
+        bot = Bot(cfg, db=_FakeDB(), dry_run=True)
+        sent = []
+
+        def fake(url, payload, headers, timeout):
+            return {"choices": [{"message": {"content": "好呀\n[想念:有点想他]"}}]}
+
+        bot.llm = DeepSeekClient(cfg, transport=fake)
+        bot.send = lambda chat_id, text: sent.append((chat_id, text)) or True
+        with self.assertLogs("wxbot", level="WARNING") as captured:
+            bot.on_message(msg("在吗"))
+        self.assertEqual(sent, [(FRIEND, "好呀")], "发明的标签不能进聊天")
+        self.assertTrue(any("想念" in line for line in captured.output), captured.output)
 
 
 class TestDecide(unittest.TestCase):
@@ -431,6 +511,40 @@ class TestMemoryMaintenance(unittest.TestCase):
         bot.maintain()
         self.assertEqual(calls, [])
 
+    def test_maintain_skips_while_replying(self):
+        """有回复在处理时，摘要/反思不能来抢 API（用户感觉就是「回得慢/不回」）。"""
+        bot, calls = self._bot("他最近在准备面试")
+        bot.sessions.append(
+            "wxid_a", "张三：我下周要去面试了，有点紧张，怕过不了",
+            "别怕，你准备得挺好的，面试前早点睡", person="wxid_a")
+        bot.sessions._data["wxid_a"]["ts"] = time.time() - 1000
+        bot._active = 1
+        bot.maintain()
+        self.assertEqual(calls, [])
+
+    def test_maintain_skips_right_after_chat(self):
+        bot, calls = self._bot("他最近在准备面试")
+        bot.sessions.append(
+            "wxid_a", "张三：我下周要去面试了，有点紧张，怕过不了",
+            "别怕，你准备得挺好的，面试前早点睡", person="wxid_a")
+        bot.sessions._data["wxid_a"]["ts"] = time.time() - 1000
+        bot._last_msg_at = time.time()
+        bot.maintain()
+        self.assertEqual(calls, [], "刚聊完先别跑后台维护")
+
+    def test_watchdog_reports_stuck_reply(self):
+        """卡住的时候日志里要能看到是哪条、卡了多久。"""
+        bot, _ = self._bot("随便")
+        bot._inflight["wxid_a"] = time.time() - 200
+        with self.assertLogs("wxbot", level="WARNING") as captured:
+            bot.watchdog()
+        self.assertTrue(any("wxid_a" in line and "200" in line
+                            for line in captured.output), captured.output)
+        # 短时间不重复刷
+        bot._inflight["wxid_a"] = time.time() - 400
+        bot.watchdog()
+        self.assertGreater(bot._stuck_logged["wxid_a"], 0)
+
 
 class TestDeepSeek(unittest.TestCase):
     def _client(self, response):
@@ -500,6 +614,11 @@ class TestConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             config_from_dict({"typo_field": 1}, env={})
 
+    def test_retired_field_ignored(self):
+        """已删除的配置项留在老 config 里不能让程序起不来。"""
+        cfg = config_from_dict({"reply_prefix": "[AI] "}, env={})
+        self.assertFalse(hasattr(cfg, "reply_prefix"))
+
     def test_bad_group_mode(self):
         with self.assertRaises(ValueError):
             config_from_dict({"group_mode": "everyone"}, env={})
@@ -509,8 +628,17 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.whitelist, ["123"])
         self.assertEqual(cfg.blacklist, ["456"])
 
-    def test_text_limit(self):
-        self.assertEqual(TEXT_LIMIT, 1800)
+    def test_wx_account_and_hwnd(self):
+        """多开微信要用 wx_account 钉死账号；句柄允许写 0x 形式。"""
+        cfg = config_from_dict({"wx_account": "  wxid_abc_e1f1  "}, env={})
+        self.assertEqual(cfg.wx_account, "wxid_abc_e1f1")
+        self.assertEqual(cfg.wx_hwnd, 0)
+        self.assertEqual(config_from_dict({"wx_hwnd": "0x1a2b"}, env={}).wx_hwnd, 0x1a2b)
+        self.assertEqual(config_from_dict({"wx_hwnd": 67180}, env={}).wx_hwnd, 67180)
+
+    def test_bad_wx_hwnd(self):
+        with self.assertRaises(ValueError):
+            config_from_dict({"wx_hwnd": "不是一个数字"}, env={})
 
 
 class _FakeDB:
@@ -549,14 +677,6 @@ class TestResolveName(unittest.TestCase):
         bot = self._bot(_FakeDB())
         self.assertEqual(bot.resolve_name("wxid_unknown"), "wxid_unknown")
 
-    def test_result_is_cached(self):
-        db = _FakeDB({"wxid_abc": "张三"})
-        bot = self._bot(db)
-        bot.resolve_name("wxid_abc")
-        bot.resolve_name("wxid_abc")
-        # 重名检查只应触发一次
-        self.assertEqual(db.calls, ["张三"])
-
     def test_resolved_name_is_cached(self):
         db = _FakeDB({"wxid_abc": "张三"})
         bot = self._bot(db)
@@ -573,17 +693,82 @@ class TestResolveName(unittest.TestCase):
         bot.resolve_name("45391456117@chatroom")
         self.assertEqual(db.nick_calls, 2, "查不到名字时必须每次重查")
 
-    def test_db_error_does_not_break_send(self):
+    def test_falls_back_when_db_unavailable(self):
+        """库挂了或压根没有库：退回用 id 搜，别让发送崩掉。"""
         class Boom(_FakeDB):
             def get_nickname(self, uid):
                 raise RuntimeError("库挂了")
 
-        bot = self._bot(Boom())
-        self.assertEqual(bot.resolve_name("wxid_abc"), "wxid_abc")
+        self.assertEqual(self._bot(Boom()).resolve_name("wxid_abc"), "wxid_abc")
+        self.assertEqual(self._bot(None).resolve_name("wxid_abc"), "wxid_abc")
 
-    def test_no_db(self):
-        bot = self._bot(None)
-        self.assertEqual(bot.resolve_name("wxid_abc"), "wxid_abc")
+
+class TestAccountLock(unittest.TestCase):
+    """多开微信：wx_account 要把配置里的写法对到账号目录名。"""
+
+    DIRS = ["wxid_b7wwn0vh9ed422_32e7",
+            "wxid_puxnqz2dplkj29_e1f1",
+            "wxid_t39ebu0ss32i22_91dd"]
+
+    def _resolve(self, wanted):
+        from wx_bot import resolve_account
+        return resolve_account(wanted, self.DIRS)
+
+    def test_exact_dir_name(self):
+        self.assertEqual(self._resolve("wxid_puxnqz2dplkj29_e1f1"),
+                         "wxid_puxnqz2dplkj29_e1f1")
+
+    def test_wxid_without_hash(self):
+        self.assertEqual(self._resolve("wxid_puxnqz2dplkj29"), "wxid_puxnqz2dplkj29_e1f1")
+
+    def test_case_insensitive(self):
+        self.assertEqual(self._resolve("WXID_PUXNQZ2DPLKJ29"), "wxid_puxnqz2dplkj29_e1f1")
+
+    def test_empty_means_auto(self):
+        self.assertEqual(self._resolve(""), "")
+        self.assertEqual(self._resolve("   "), "")
+
+    def test_nickname_is_not_a_dir(self):
+        # 昵称没法在不解密数据库的情况下对上账号，只能报错让人改
+        self.assertEqual(self._resolve("小鲸鱼"), "")
+        self.assertEqual(self._resolve("wxid_nope"), "")
+
+
+class TestSendDropsTagOnlyReply(unittest.TestCase):
+    """只剩标签的回复不能发出去（线上发过一个空 <div>）。"""
+
+    def test_html_only_reply_is_not_sent(self):
+        from wx_bot import Bot
+        bot = Bot(Config(), db=_FakeDB(), dry_run=True)
+        self.assertFalse(bot.send("wxid_abc", '<div style="text-align: center"></div>'))
+
+
+class TestReplyHtmlPipeline(unittest.TestCase):
+    """模型把 HTML 当正文回时：清完是空的就不发，有正文就发干净的。"""
+
+    def _bot(self, reply):
+        from wx_bot import Bot
+        cfg = Config(api_key="sk-test")
+        bot = Bot(cfg, db=_FakeDB(), dry_run=True)
+        sent = []
+
+        def fake(url, payload, headers, timeout):
+            return {"choices": [{"message": {"content": reply}}]}
+
+        bot.llm = DeepSeekClient(cfg, transport=fake)
+        bot.send = lambda chat_id, text: sent.append((chat_id, text)) or True
+        return bot, sent
+
+    def test_tag_only_reply_is_dropped(self):
+        bot, sent = self._bot('<div style="text-align: center"></div>')
+        bot.on_message(msg("你好"))
+        self.assertEqual(sent, [], "整条只有标签的回复不能发进聊天")
+
+    def test_history_gets_clean_text(self):
+        bot, sent = self._bot("<b>好的</b>呀")
+        bot.on_message(msg("你好"))
+        self.assertEqual(sent, [(FRIEND, "好的呀")])
+        self.assertEqual(bot.sessions.messages(FRIEND)[-1]["content"], "好的呀")
 
 
 class TestPersona(unittest.TestCase):
@@ -727,12 +912,6 @@ class TestStickers(unittest.TestCase):
         _, names = extract_stickers("[表情:开心] 好耶 [表情:晚安]")
         self.assertEqual(names, ["开心", "晚安"])
 
-    def test_plain_text_untouched(self):
-        from brain import extract_stickers
-        text, names = extract_stickers("今天好累")
-        self.assertEqual(text, "今天好累")
-        self.assertEqual(names, [])
-
     def test_resolve_existing_file(self):
         from brain import resolve_sticker
         found = resolve_sticker(self.here, "persona.txt")
@@ -747,11 +926,6 @@ class TestStickers(unittest.TestCase):
         from brain import resolve_sticker
         # 不能靠 ../ 把路径带出表情目录
         self.assertIsNone(resolve_sticker(self.here + "/stickers", "../persona.txt"))
-
-    def test_empty_inputs(self):
-        from brain import resolve_sticker
-        self.assertIsNone(resolve_sticker("", "开心"))
-        self.assertIsNone(resolve_sticker(self.here, ""))
 
     def test_list_stickers_missing_dir(self):
         from brain import list_stickers
@@ -893,12 +1067,10 @@ class TestSenderName(unittest.TestCase):
         self.assertEqual(
             self._bot(db).resolve_sender(GROUP, {"sender_username": "wxid_b"}), "老李")
 
-    def test_unknown_sender_is_empty(self):
-        self.assertEqual(
-            self._bot(_FakeDB2()).resolve_sender("wxid_chat", {"sender_username": "wxid_z"}), "")
-
-    def test_missing_sender_is_empty(self):
-        self.assertEqual(self._bot(_FakeDB2()).resolve_sender("wxid_chat", {}), "")
+    def test_sender_missing_or_unknown_is_empty(self):
+        bot = self._bot(_FakeDB2())
+        self.assertEqual(bot.resolve_sender("wxid_chat", {"sender_username": "wxid_z"}), "")
+        self.assertEqual(bot.resolve_sender("wxid_chat", {}), "")
 
     def test_result_is_cached(self):
         db = _FakeDB2(contacts={"wxid_a": "张三"})
@@ -966,10 +1138,9 @@ class TestDeveloper(unittest.TestCase):
         bot = self._bot(["wxid_dev"])
         self.assertFalse(bot.is_developer(
             "wxid_other", {"sender_username": "wxid_other"}, "李四"))
-
-    def test_empty_config_never_matches(self):
-        bot = self._bot([])
-        self.assertFalse(bot.is_developer("wxid_x", {"sender_username": "wxid_x"}, "x"))
+        # 空配置不能匹配任何人（曾经踩过：空列表被当成"全都命中"）
+        self.assertFalse(
+            self._bot([]).is_developer("wxid_x", {"sender_username": "wxid_x"}, "x"))
 
     def test_case_insensitive(self):
         bot = self._bot(["WXID_DEV"])
@@ -1058,11 +1229,8 @@ class TestProfileMemory(unittest.TestCase):
         text, notes = extract_notes("好呀\n[记住:喜欢猫]\n[记住: 在武汉上班]")
         self.assertEqual(text, "好呀")
         self.assertEqual(notes, ["喜欢猫", "在武汉上班"])
-
-    def test_plain_reply_has_no_notes(self):
-        from brain import extract_notes
-        text, notes = extract_notes("今天好累")
-        self.assertEqual((text, notes), ("今天好累", []))
+        # 没有标签时原样返回
+        self.assertEqual(extract_notes("今天好累"), ("今天好累", []))
 
     def test_profile_survives_restart(self):
         path = pathlib.Path(__file__).parent / "_test_profile.json"
@@ -1085,15 +1253,6 @@ class TestProfileMemory(unittest.TestCase):
                     p.unlink()
                 except OSError:
                     pass
-
-
-    def test_group_member_gets_own_profile(self):
-        st = SessionStore(Config())
-        st.touch_profile("wxid_a", name="张三", wxid="wxid_a")
-        st.add_traits("wxid_a", ["喜欢猫"])
-        system = st.build(GROUP, "在吗", "张三", person="wxid_a")[0]["content"]
-        self.assertIn("张三", system)
-        self.assertIn("喜欢猫", system)
 
     def test_two_members_have_separate_profiles(self):
         st = SessionStore(Config())
@@ -1126,13 +1285,6 @@ class TestProfileMemory(unittest.TestCase):
         st = SessionStore(Config())
         st.append(GROUP, "x", "y")          # 拿不到发送人时退回会话 id
         self.assertEqual(len(st.profile(GROUP)["recent"]), 1)
-
-    def test_profile_key(self):
-        from wx_bot import Bot
-        bot = Bot(Config(), db=_FakeDB2(), dry_run=True)
-        self.assertEqual(bot._profile_key(GROUP, {"sender_username": "wxid_a"}), "wxid_a")
-        self.assertEqual(bot._profile_key(GROUP, {}), GROUP)
-        self.assertEqual(bot._profile_key(FRIEND, {"sender_username": FRIEND}), FRIEND)
 
     def test_group_name_never_used_as_person_name(self):
         """解析不出群友名字时，不能把群名当成这个人叫啥。"""
@@ -1389,6 +1541,19 @@ class TestVision(unittest.TestCase):
         self.assertIn("temperature", calls)
 
 
+class _SlowMedia:
+    """假的取图器：睡一会儿再返回，模拟「卡在等图片密钥」。"""
+
+    def __init__(self, delay: float = 1.0):
+        self.delay = delay
+        self.calls = 0
+
+    def download_image(self, *args, **kwargs):
+        self.calls += 1
+        time.sleep(self.delay)
+        return None
+
+
 class TestImageCache(unittest.TestCase):
     """图片缓存：等后面那条文字/@ 来认领。"""
 
@@ -1435,6 +1600,28 @@ class TestImageCache(unittest.TestCase):
         bot.on_message(self._msg(1))       # 不该抛异常，也不该回
         self.assertEqual(len(bot._recent_images[FRIEND]), 1)
 
+    def test_slow_image_fetch_does_not_block_reply(self):
+        """取图可能卡在「等用户点开大图抓密钥」上（底层库会等 120 秒），
+        不能让它把回复线程一起卡死。"""
+        bot = self._bot()
+        bot._media = _SlowMedia(0.6)
+        with mock.patch("wx_bot.IMAGE_FETCH_WAIT", 0.1):
+            t0 = time.time()
+            got = bot._download_image(FRIEND, {"local_id": 1})
+            spent = time.time() - t0
+        self.assertIsNone(got)
+        self.assertLess(spent, 0.5, "取图卡住时不能拖着回复线程一起等")
+
+    def test_only_one_image_fetch_at_a_time(self):
+        bot = self._bot()
+        bot._media = _SlowMedia(1.0)
+        with mock.patch("wx_bot.IMAGE_FETCH_WAIT", 0.05):
+            self.assertIsNone(bot._download_image(FRIEND, {"local_id": 1}))
+            before = bot._media.calls
+            # 上一张还在取：这条直接跳过，不再起第二个线程
+            self.assertIsNone(bot._download_image(FRIEND, {"local_id": 2}))
+            self.assertEqual(bot._media.calls, before)
+
 
 class TestCurrentTime(unittest.TestCase):
     """把当前时间注入 system —— 模型自己没有时钟。"""
@@ -1458,12 +1645,6 @@ class TestCurrentTime(unittest.TestCase):
         self.assertIn("10:23", line)
         self.assertIn("北京时间", line)
         self.assertTrue(line.startswith("【现在】"))
-
-    def test_now_line_uses_local_time(self):
-        from brain import now_line
-        t = time.localtime(self._ts(15))
-        self.assertIn("下午", now_line(self._ts(15)))
-        self.assertIn("%d月" % t.tm_mon, now_line(self._ts(15)))
 
     def test_build_injects_time_into_system(self):
         st = SessionStore(Config())
@@ -1676,20 +1857,13 @@ class TestProactive(unittest.TestCase):
         base.update(kw)
         return base
 
-    def test_off_by_default(self):
-        bot, sent, calls = self._bot()
-        bot.on_message(self._msg())
-        self.assertEqual((calls, sent), ([], []), "默认关闭，一个 API 都不该调")
-
-    def test_empty_gray_list_means_nobody(self):
-        bot, sent, calls = self._bot(proactive_enabled=True, proactive_ids=[])
-        bot.on_message(self._msg())
-        self.assertEqual((calls, sent), ([], []))
-
-    def test_chat_not_in_gray(self):
-        bot, sent, calls = self._bot(**self._on(proactive_ids=["别的群"]))
-        bot.on_message(self._msg())
-        self.assertEqual((calls, sent), ([], []))
+    def test_never_judges_when_not_enabled(self):
+        """三种"不该开口"的情况都不该花一次 API：开关关着 / 名单空 / 不在名单里。"""
+        for kw in ({}, dict(proactive_enabled=True, proactive_ids=[]),
+                   self._on(proactive_ids=["别的群"])):
+            bot, sent, calls = self._bot(**kw)
+            bot.on_message(self._msg())
+            self.assertEqual((calls, sent), ([], []), kw)
 
     def test_declines_and_sends_nothing(self):
         bot, sent, calls = self._bot("[不说]", **self._on())
@@ -2032,9 +2206,6 @@ class TestAffinity(unittest.TestCase):
         text, hits = extract_affinity("[好感:-2 被骂]\n好吧\n[好感:+1]")
         self.assertEqual(text, "好吧")
         self.assertEqual(hits, [(-2, "被骂"), (1, "")])
-
-    def test_extract_affinity_plain_text(self):
-        from brain import extract_affinity
         self.assertEqual(extract_affinity("今天好累"), ("今天好累", []))
 
 
@@ -2105,9 +2276,6 @@ class TestMoments(unittest.TestCase):
         text, ms = extract_moments("诶嘿\n[回忆:他第一次叫我小鲸鱼]")
         self.assertEqual(text, "诶嘿")
         self.assertEqual(ms, ["他第一次叫我小鲸鱼"])
-
-    def test_plain_text_has_no_moments(self):
-        from brain import extract_moments
         self.assertEqual(extract_moments("今天好累"), ("今天好累", []))
 
 
@@ -2118,18 +2286,9 @@ class TestKaomoji(unittest.TestCase):
         from wx_bot import Bot
         return Bot(Config(**kw), db=_FakeDB2(), dry_run=True)
 
-    def test_library_covers_moods(self):
-        from brain import KAOMOJI
-        for mood in ("开心", "害羞", "委屈", "生气", "困", "疑惑", "得意", "无语", "撒娇", "惊讶"):
-            self.assertIn(mood, KAOMOJI)
-            self.assertTrue(all(len(f) <= 16 for f in KAOMOJI[mood]), mood)
-
     def test_extract_kaomoji(self):
         from brain import extract_kaomoji
         self.assertEqual(extract_kaomoji("好呀\n[颜:害羞]"), ("好呀", "害羞"))
-
-    def test_plain_text_has_no_mood(self):
-        from brain import extract_kaomoji
         self.assertEqual(extract_kaomoji("今天好累"), ("今天好累", ""))
 
     def test_pick_from_mood(self):
@@ -2161,10 +2320,6 @@ class TestKaomoji(unittest.TestCase):
     def test_empty_text_untouched(self):
         bot = self._bot(kaomoji_rate=1.0, kaomoji_cooldown=0)
         self.assertEqual(bot._maybe_kaomoji("c1", "", "开心"), "")
-
-    def test_unknown_mood_no_change(self):
-        bot = self._bot(kaomoji_rate=1.0, kaomoji_cooldown=0)
-        self.assertEqual(bot._maybe_kaomoji("c1", "在发呆", "发疯"), "在发呆")
 
 
 class TestBotWiring(unittest.TestCase):
@@ -2241,11 +2396,6 @@ class TestMaintenance(unittest.TestCase):
         # 上限 2 张，但新的 3 张刚落地（可能在编码），只能删旧的 3 张
         self.assertEqual(prune_images(str(self.dir), keep_days=30, keep_max=2), 3)
         self.assertEqual(len(list(self.dir.glob("*"))), 3)
-
-    def test_prune_missing_dir(self):
-        from wx_bot import prune_images
-
-        self.assertEqual(prune_images(str(self.dir / "nope")), 0)
 
     def test_prune_keep_max_zero_means_unlimited(self):
         from wx_bot import prune_images

@@ -160,7 +160,6 @@ class Config:
     developer_ids: List[str] = field(default_factory=list)
 
     rate_limit: int = 50            # 每个会话每小时最多回答几次
-    reply_prefix: str = ""          # 回复前缀，比如 "「AI」"
     reply_split: bool = True        # 多行回复拆成几条发（像真人一句一句打出来）
     reply_split_max: int = 5        # 最多拆成几条，超了并到最后一条
     sticker_dir: str = "stickers"   # 表情图片目录（相对 config.json）
@@ -185,6 +184,12 @@ class Config:
     # natural 会让每次写操作之间等 2.5~6 秒，回复会很磨叽；默认关掉
     rhythm_profile: str = "off"
     wx_debug: bool = False          # 打开 wechatauto 自己的调试日志（排错用）
+    # ---- 多开微信：锁定一个主账号 ----
+    # 电脑上同时登着两个微信时，"最近改动的库" 这种自动选择会在两个账号之间飘，
+    # 于是机器人可能读着 A 的库、却用 B 的窗口发消息。填上账号就钉死：
+    # wxid 或账号目录名（形如 wxid_xxx_e1f1，启动日志里会打印）。
+    wx_account: str = ""
+    wx_hwnd: int = 0                # 锁定发送窗口句柄（0=自动）；换微信窗口后会变
     dry_run: bool = False           # True 时只打印不发送
     log_file: str = "wxbot.log"
     log_max_bytes: int = 2 * 1024 * 1024   # 单个日志文件上限，超了轮转（0 = 不轮转）
@@ -204,9 +209,14 @@ def config_from_dict(data: dict, env=None) -> Config:
         raise ValueError("配置必须是一个 JSON 对象")
 
     allowed = set(Config.__dataclass_fields__)
-    unknown = set(data) - allowed
+    # 已经删掉的功能：老配置里可能还留着这些键，静默忽略，
+    # 否则升级后一启动就报「未知字段」直接退出。
+    retired = {"reply_prefix"}
+    unknown = set(data) - allowed - retired
     if unknown:
         raise ValueError(f"配置里有未知字段: {sorted(unknown)}")
+    for key in sorted(retired & set(data)):
+        logger.warning("配置里的 %s 已经废弃，会被忽略", key)
 
     cfg = Config(**{k: v for k, v in data.items() if k in allowed})
     cfg.api_key = env.get("DEEPSEEK_API_KEY", cfg.api_key)
@@ -221,6 +231,16 @@ def config_from_dict(data: dict, env=None) -> Config:
     cfg.developer_ids = [str(x) for x in cfg.developer_ids]
     cfg.proactive_ids = [str(x) for x in cfg.proactive_ids]
     cfg.proactive_chance = max(0.0, min(1.0, float(cfg.proactive_chance or 0)))
+    cfg.wx_account = str(cfg.wx_account or "").strip()
+    # 句柄允许写成十进制数字或 "0x1a2b" 字符串
+    raw_hwnd = cfg.wx_hwnd
+    try:
+        if isinstance(raw_hwnd, str) and raw_hwnd.strip():
+            cfg.wx_hwnd = int(raw_hwnd.strip(), 0)
+        else:
+            cfg.wx_hwnd = int(raw_hwnd or 0)
+    except (TypeError, ValueError):
+        raise ValueError("wx_hwnd 必须是窗口句柄数字（0 表示自动；可用 --wx-list 查看）") from None
     return cfg
 
 
@@ -300,6 +320,92 @@ def strip_mentions(content: str, my_names: Sequence[str]) -> str:
             continue
         text = re.sub(r"@" + re.escape(name) + r"[\s\u2005\u00a0]*", " ", text)
     return text.strip()
+
+
+# ──────────────────── 回复里夹带的 HTML：一律清掉 ────────────────────
+# 线上真实案例：模型整条只回了一个 <div style="text-align: center"></div>，
+# 程序把这行源码原样发进了聊天。模型偶尔会模仿网页/富文本，这里兜底。
+# 只认白名单里的标签名——否则会把 <(_ _)>、<(￣︶￣)> 这类颜文字一起吃掉。
+
+_HTML_TAG_NAMES = (
+    "a|abbr|article|aside|audio|b|big|blockquote|body|br|caption|center|cite|"
+    "code|dd|del|details|div|dl|dt|em|figcaption|figure|font|footer|h[1-6]|"
+    "head|header|hr|html|i|iframe|img|ins|kbd|li|main|mark|nav|ol|p|picture|"
+    "pre|q|s|samp|section|small|source|span|strike|strong|sub|summary|sup|"
+    "table|tbody|td|tfoot|th|thead|title|tr|u|ul|var|video"
+)
+# 行内标签直接删（留着会粘字），块级标签换成换行（不然几段话会挤成一行）
+_HTML_INLINE_TAGS = (
+    "a|abbr|b|big|cite|code|del|em|font|i|ins|kbd|mark|q|s|samp|small|"
+    "span|strike|strong|sub|sup|u|var"
+)
+_HTML_BLOCK_TAGS = (
+    "article|aside|blockquote|caption|center|dd|details|div|dl|dt|figcaption|"
+    "figure|footer|h[1-6]|header|hr|li|main|nav|ol|p|pre|section|summary|"
+    "table|tbody|td|tfoot|th|thead|tr|ul|body|html|head|title"
+)
+
+_HTML_RAW_BLOCK = re.compile(r"<(script|style)\b[^<>]*>.*?</\1\s*>", re.I | re.S)
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+_HTML_EMPTY_PAIR = re.compile(r"<(%s)\b[^<>]*>\s*</\1\s*>" % _HTML_TAG_NAMES, re.I)
+_HTML_BR = re.compile(r"</?br\b[^<>]*>", re.I)
+_HTML_BLOCK_TAG = re.compile(r"</?(?:%s)\b[^<>]*>" % _HTML_BLOCK_TAGS, re.I)
+_HTML_INLINE_TAG = re.compile(r"</?(?:%s)\b[^<>]*>" % _HTML_INLINE_TAGS, re.I)
+_HTML_OTHER_TAG = re.compile(
+    r"</?(?:img|source|iframe|video|audio|picture|body|html|head|title)\b[^<>]*>", re.I)
+
+# 常见 HTML 实体：还原成普通字符，否则聊天里会看到 &nbsp; 这种东西
+_HTML_ENTITIES = {
+    "nbsp": " ", "amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'",
+    "mdash": "—", "ndash": "–", "hellip": "…", "middot": "·",
+    "ldquo": "“", "rdquo": "”", "lsquo": "‘", "rsquo": "’",
+}
+_HTML_ENTITY_RE = re.compile(r"&(#\d{1,6}|#x[0-9a-fA-F]{1,5}|[a-zA-Z]{2,8});")
+
+
+def _entity_char(m) -> str:
+    name = m.group(1)
+    if name.startswith("#"):
+        try:
+            code = int(name[2:], 16) if name[1:2].lower() == "x" else int(name[1:])
+        except ValueError:
+            return m.group(0)
+        return chr(code) if 0 < code < 0x110000 else m.group(0)
+    return _HTML_ENTITIES.get(name.lower(), m.group(0))
+
+
+def clean_reply(text: str) -> str:
+    """把模型回复里夹带的 HTML 清掉，返回能直接发进微信的纯文本。
+
+    - `<div style="text-align: center"></div>` → 空（整条只有标签的回复会被丢弃）
+    - `<div>你好</div>` → `你好`；`<br>` → 换行
+    - `&nbsp;` `&amp;` 这类实体还原成普通字符
+    - 颜文字 `<(￣︶￣)>`、笑脸 `<3` 里的尖括号不在白名单里，原样保留
+
+    没有尖括号也没有 `&` 的普通文本原样返回（不做任何改动）。
+    """
+    raw = str(text or "")
+    if not raw or ("<" not in raw and "&" not in raw):
+        return raw
+
+    out = _HTML_RAW_BLOCK.sub("", raw)      # <script>/<style> 连内容一起删
+    out = _HTML_COMMENT.sub("", out)
+    for _ in range(3):                      # <div><p></p></div> 这种嵌套空标签
+        new = _HTML_EMPTY_PAIR.sub("", out)
+        if new == out:
+            break
+        out = new
+    out = _HTML_BR.sub("\n", out)
+    out = _HTML_BLOCK_TAG.sub("\n", out)
+    out = _HTML_INLINE_TAG.sub("", out)
+    out = _HTML_OTHER_TAG.sub("", out)
+    out = _HTML_ENTITY_RE.sub(_entity_char, out)
+
+    # 标签换成换行后常留下「\n 你好 \n」这种空行，收一下
+    out = out.replace("\r\n", "\n").replace("\r", "\n")
+    out = "\n".join(line.rstrip() for line in out.split("\n"))
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
 
 
 @dataclass
@@ -1741,6 +1847,45 @@ def pick_kaomoji(mood: str, rng: Optional[object] = None) -> str:
     if not faces:
         return ""
     return (rng or random).choice(faces)
+
+
+# 协议里的五个标签：模型只能写这些，写别的就是它自己发明的
+_KNOWN_TAG_NAMES = {"记住", "好感", "回忆", "颜", "表情"}
+
+# 形如 [想念:xxx] / 【心情：xxx】：方括号 + 短标签名 + 冒号 + 内容。
+# 只用于「已知标签都抠完之后」的兜底，所以这里出现的都是模型发明的标签。
+_UNKNOWN_TAG = re.compile(
+    r"[\[【]\s*([\u4e00-\u9fa5A-Za-z]{1,6})\s*[:：]\s*([^\[\]【】]{0,200}?)\s*[\]】]")
+
+
+def strip_unknown_tags(text: str) -> Tuple[str, List[str]]:
+    """删掉模型自己发明的标签，返回 (剩下的文本, [标签名])。
+
+    线上真发生过：模型该写 `[回忆:...]` 时写成了 `[想念:他说要给我充token]`，
+    程序不认识这个标签，就把它当正文发进聊天了 —— 带冒号的方括号在聊天里
+    几乎不可能是正常内容，所以一律当标签处理。
+
+    五个已知标签名会被原样保留（本函数可以放在抠标签之前调用）。
+    注意 `[1]`、`【公告】`、`[狗头]` 这种没有冒号的内容不受影响。
+    """
+    raw = str(text or "")
+    if not raw or (":" not in raw and "：" not in raw):
+        return raw, []
+
+    names: List[str] = []
+
+    def _drop(m) -> str:
+        name = m.group(1)
+        if name in _KNOWN_TAG_NAMES:      # 已知标签交给各自的 extractor
+            return m.group(0)
+        names.append(name)
+        return ""
+
+    clean = _UNKNOWN_TAG.sub(_drop, raw)
+    if not names:
+        return raw, []
+    clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+    return clean, names
 
 
 def list_stickers(sticker_dir: str) -> List[str]:

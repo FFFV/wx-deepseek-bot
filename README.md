@@ -40,6 +40,7 @@
 | 长期记忆 | 记住每个人的事，会话闲置后自动摘要，每天整理一次 | 开 |
 | 好感度 | 0~100 分，影响语气，可以查询 | 开 |
 | 主动说话 | 没被 @ 也可能自己接一句（实验功能，需灰度名单） | 关 |
+| 多开微信 | 钉死一个微信号和它的窗口，不会读错号、发错号 | 开 |
 
 ---
 
@@ -132,7 +133,6 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 | `temperature` | `1.0` | 越高越随机 |
 | `thinking` | `false` | 思考模式。开着更慢更贵，聊天场景建议关 |
 | `timeout` | `60` | 单次请求超时（秒） |
-| `reply_prefix` | `""` | 回复前缀，比如 `"[AI] "` |
 | `reply_split` | `true` | 多行拆成几条发 |
 | `reply_split_max` | `5` | 最多拆几条，超了并到最后一条 |
 | `rate_limit` | `50` | 每个会话每小时最多回几条 |
@@ -226,6 +226,38 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 | `rhythm_profile` | `off` | 拟人节流档位。开着会让每次操作等 2.5~6 秒，建议 `off` |
 | `wx_debug` | `false` | 打开底层库的调试日志（排错用） |
 
+### 多开微信（两个微信同时登着）
+
+电脑上同时登着两个及以上微信号时，程序默认靠"哪个库最近改过"猜账号，两个号都活跃就会猜错。用这两个字段钉死一个：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `wx_account` | `""` | 只认这个微信号。填 **wxid**（如 `wxid_abc123`）或账号目录名（如 `wxid_abc123_e1f1`）。留空 = 自动挑，可能挑错 |
+| `wx_hwnd` | `0` | 发消息用哪个微信窗口。`0` = 自动；发现回错了号再手工填 |
+
+账号目录名和窗口句柄都可以用 `run.cmd --wx-list` 查出来：
+
+```
+账号目录：
+  wxid_abc123_e1f1
+  wxid_def456_9a8b
+
+微信窗口：
+  [1] hwnd=67180  pid=12940  1386x1001
+  [2] hwnd=132718 pid=20884  1000x800
+```
+
+填法：
+
+```json
+"wx_account": "wxid_abc123",
+"wx_hwnd": 0
+```
+
+`wx_hwnd` 平时留 `0` 就行——程序会先按"谁打开着这个账号的数据库"去对窗口，对不上才退回面积最大的那个，并在日志里写明。换过微信窗口以后句柄会变，所以只有自动匹配不准时才手工填。
+
+**两个微信号只留一个在跑，就不用管这两个字段。**
+
 ---
 
 ## 五、启动与停止
@@ -237,11 +269,15 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 | 只听不回 | `run.cmd --dry-run` |
 | 只监听指定会话 | `run.cmd --chat wxid_xxx`（群是 `12345678901@chatroom`，可写多次） |
 | 用别的配置文件 | `run.cmd --config other.json` |
+| 查微信账号 / 窗口 | `run.cmd --wx-list`（多开微信、要锁定账号时用） |
 | 停止 | 在窗口里按 `Ctrl+C` |
 
 启动成功的日志长这样：
 
 ```
+正在打开微信数据库（锁定账号 wxid_xxx）…
+微信数据库就绪（0.4s）：小鲸鱼（wxid_xxx）
+已锁定微信账号：wxid_xxx_e1f1；忽略另外 1 个账号目录（wxid_yyy_9a8b）
 登录账号：xxx（wxid_xxx）
 模型：deepseek-flash｜群聊策略：at｜白名单：不限制
 人设：persona.txt（3140 字）
@@ -281,7 +317,7 @@ copy persona.txt persona.local.txt
 | `[颜:情绪]` | 贴一个颜文字 | `[颜:害羞]` |
 | `[表情:名字]` | 发一张 `stickers/` 里的图 | `[表情:开心]` |
 
-标记本身不会出现在聊天里，程序会把它们抠掉。
+标记本身不会出现在聊天里，程序会把它们抠掉。模型自己发明的其它标签（比如 `[想念:]`、`【心情：…】`）也会被删掉，不会发进聊天。
 
 ### 6.2 群里什么时候回
 
@@ -313,6 +349,8 @@ stickers/晚安.gif
 对方发图后**紧接着的那条消息**（默认 60 秒内）会被一起看。
 
 首次使用需要"喂"一次密钥：**在微信里点开任意一张大图看几秒**，程序会抓到图片的解密密钥并缓存，之后就不用管了。
+
+没抓到密钥时，取图最多等 20 秒——等不到就先回文字，不会一直卡着不说话。
 
 如果图片是 `.wxgf`（微信 4.x 的私有容器），还需要 ffmpeg —— `pip install imageio-ffmpeg`，或者自己装 ffmpeg 到 PATH。
 
@@ -370,7 +408,21 @@ stickers/晚安.gif
 
 触发点永远是别人的一条消息，不会定时凭空找人聊天。
 
-### 6.9 命令
+### 6.9 多开微信
+
+同时登着两个微信号时，先跑一次：
+
+```bat
+run.cmd --wx-list
+```
+
+把打印出来的账号目录名（或它的 wxid 前缀）填进 `config.json` 的 `wx_account`，重启程序。启动日志里出现「已锁定微信账号：…」就说明钉住了，另一个号的消息不会被读、也不会被用来发消息。
+
+如果发现回复出现在错误的微信号上（日志里会有「检测到 N 个微信窗口……先按面积最大的那个发」的警告），把 `--wx-list` 里对应的 `hwnd` 填进 `wx_hwnd`。
+
+**不用锁定也能跑**：只登一个微信号时，程序自动选，不需要配这两项。
+
+### 6.10 命令
 
 发下面这些词，会走程序自带逻辑（不经过模型）：
 
@@ -403,15 +455,19 @@ stickers/晚安.gif
 | `找不到配置文件 config.json` | 先复制一份：`copy config.example.json config.json` |
 | `还没有 DeepSeek API Key` | 填 `config.json` 的 `api_key`，或设环境变量 `DEEPSEEK_API_KEY` |
 | `未检测到 Weixin.exe` | 微信没开，或者进程名不是 Weixin.exe |
-| `数据库无可用密钥` | Python 不是 64 位 / 权限不够 / 多账号选错 |
+| `数据库无可用密钥` | Python 不是 64 位 / 权限不够 / 多账号选错（用 `wx_account` 锁账号） |
 | `ImportError: win32ui` | pywin32 没装好，重装 `pywin32` 或跑它的 `pywin32_postinstall.py` |
 | `ModuleNotFoundError: No module named 'wechatauto'` | 依赖没装，双击 `install.cmd` 或 `pip install -r requirements.txt` |
 | 发送返回失败但没报错 | 微信窗口被最小化或被别的窗口盖住 |
 | 回了自己的消息 | `sender_username` 没解析出来，把 `my_names` 和白名单配好 |
 | 识图一直没反应 | 图片没解密：在微信里点开任意一张大图看几秒 |
+| 发图之后半天不回 | 取图卡在等密钥。程序最多等 20 秒就先回文字；在微信里点开一张大图把密钥喂上即可 |
 | `400 … unsupported image` | 图片是 `.wxgf` 容器，装 `imageio-ffmpeg` |
 | 回复偶尔要 20 多秒 | 建连时碰上了不响应的 CDN 节点，程序会在几秒内自动换一个地址；日志里会写原因 |
 | 群里一直不回 | 没 @ 你。要么 @ 一下，要么把 `group_mode` 改成 `all`（不建议） |
+| 刚启动不回消息 | 先看日志有没有「已锁定微信账号」。多开微信选错账号时会读另一个号的库（`run.cmd --wx-list` 查，填 `wx_account` 锁死）；启动卡在「正在打开微信数据库」说明在重算密钥，锁账号可避免 |
+| 回复发到了另一个微信号上 | 多开窗口选错。`run.cmd --wx-list` 查 hwnd，填进 `wx_hwnd` |
+| 发送要等很久 / 一直不回 | 日志里搜「已经等了 N 秒还没发出去」，能看出卡在模型还是卡在发送 |
 | 程序一闪就退 | 用 `run.cmd` 启动（窗口会停住）；直接双击 `python` 脚本看不清报错 |
 
 **日志**：`wxbot.log`，单文件满 2 MB 自动切一份，最多留 5 份。排错时先看最后 50 行。

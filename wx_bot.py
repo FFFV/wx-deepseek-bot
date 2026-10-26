@@ -57,6 +57,7 @@ from brain import (  # noqa: E402
     UnsupportedImage,
     WEB_SEARCH_TOOL,
     WebSearch,
+    clean_reply,
     clean_summary,
     decide,
     encode_image,
@@ -75,6 +76,7 @@ from brain import (  # noqa: E402
     split_messages,
     split_text,
     strip_sender_prefix,
+    strip_unknown_tags,
     tier_of,
 )
 
@@ -173,6 +175,9 @@ def setup_logging(cfg: Config) -> None:
 
 # 别人发来的每张图都会落一份到 _images/，只增不减会一直涨（还带着隐私）。
 IMG_MIN_AGE = 600      # 刚下载的图可能正在编码，10 分钟内不删
+# 取一张图最多等几秒。底层库在「等用户点开大图抓 AES 密钥」上会卡到 120 秒，
+# 卡住的是回复线程，所以这里给个上限（见 Bot._download_image）。
+IMAGE_FETCH_WAIT = 20.0
 
 
 def prune_images(img_dir: str, keep_days: int = 7, keep_max: int = 200,
@@ -222,6 +227,416 @@ def prune_images(img_dir: str, keep_days: int = 7, keep_max: int = 200,
     return removed
 
 
+# ─────────────────── 多开微信：锁定账号、锁定窗口 ───────────────────
+# 电脑上同时登着两个微信时，底层库有两个坑：
+#   1. 读消息：`WeChatDB()` 靠「最近改动过的库」猜账号，两个号都活跃时会猜错，
+#      于是机器人读着 A 的聊天、你还以为它没收到消息；更糟的是猜错后要重新
+#      提取密钥（扫内存 + 每个库 25 万次 PBKDF2），启动能卡好几分钟。
+#   2. 发消息：guia 用 hwnd 定位坐标，但 UIA 引擎自己会重扫所有微信窗口、
+#      挑面积最大的那个——两个窗口就变成「在这边看会话、往那边粘字」。
+# 所以这里做两件事：用 wx_account 钉死账号，用 wx_hwnd（或自动匹配）钉死窗口。
+
+_HWND_PIN_LOCK = threading.Lock()
+_MUTEX_HANDLE = None      # 单实例互斥量的句柄（进程退出自动释放）
+
+
+def acquire_single_instance(account: str) -> bool:
+    """同一个微信号只允许一个机器人进程。
+
+    两个实例同时跑会抢同一个微信窗口、抢同一份监听水位，表现就是
+    「有时候回、有时候不回」。用命名互斥量挡掉第二个。
+    系统不给建（权限/沙箱）时不拦着用户，直接放行。
+    """
+    global _MUTEX_HANDLE
+    name = "Local\\wx-deepseek-" + (account or "default")
+    try:
+        import ctypes
+
+        k32 = ctypes.windll.kernel32
+        handle = k32.CreateMutexW(None, False, name)
+        if not handle:
+            return True
+        if k32.GetLastError() == 183:       # ERROR_ALREADY_EXISTS
+            k32.CloseHandle(handle)
+            return False
+        _MUTEX_HANDLE = handle
+        return True
+    except Exception as exc:
+        log.debug("单实例检查跳过：%r", exc)
+        return True
+
+
+def list_account_dirs(db_dir: str) -> list[str]:
+    """列出微信数据目录下的账号目录名（形如 wxid_xxx_e1f1）。"""
+    if not db_dir:
+        return []
+    try:
+        from wechatauto.db import _find_account_dirs
+
+        return [os.path.basename(d) for d in _find_account_dirs(db_dir)]
+    except Exception as exc:
+        log.debug("枚举微信账号目录失败：%r", exc)
+        return []
+
+
+def wxid_of_account(dir_name: str) -> str:
+    """账号目录名去掉末尾 4 位哈希，得到 wxid。"""
+    return re.sub(r"_[A-Za-z0-9]{4}$", "", str(dir_name or ""))
+
+
+def resolve_account(wanted: str, dirs) -> str:
+    """把 wx_account 配置对到账号目录名；对不上返回空串。
+
+    支持三种写法：完整目录名（wxid_xxx_e1f1）、wxid（wxid_xxx）、
+    目录名大小写不敏感的前缀。
+    """
+    want = str(wanted or "").strip().lower()
+    if not want:
+        return ""
+    names = [str(d) for d in (dirs or [])]
+    for name in names:
+        if name.lower() == want:
+            return name
+    for name in names:
+        if wxid_of_account(name).lower() == want:
+            return name
+    for name in names:
+        if name.lower().startswith(want):
+            return name
+    return ""
+
+
+def _heartbeat(label: str, interval: float = 20.0) -> threading.Event:
+    """干一件可能很慢的事时，每隔一会儿打一行日志。
+
+    打开微信库有可能卡在「重新提取密钥」上（扫内存 + 每个库 25 万次 PBKDF2），
+    几分钟里日志一片安静，看着就像死了。有这行至少知道它在干活。
+    返回的 Event set() 一下就停。
+    """
+    stop = threading.Event()
+
+    def _run():
+        started = time.time()
+        while not stop.wait(interval):
+            log.warning("%s还在进行（已 %.0f 秒）——多半是在重新提取微信密钥，"
+                        "首次启动 / 换账号 / 微信升级后会这样，等它跑完",
+                        label, time.time() - started)
+
+    threading.Thread(target=_run, name="wx-heartbeat", daemon=True).start()
+    return stop
+
+
+def open_wechat_db(cfg: Config):
+    """打开微信数据库，返回 (db, self_info)。
+
+    配置了 `wx_account` 就只认那个账号：找不到直接报错并列出本机账号，
+    绝不退回「猜一个」——猜错的表现就是「刚启动不回消息」。
+    """
+    from wechatauto.db import WeChatDB, auto_detect_db_dir
+
+    wanted = (cfg.wx_account or "").strip()
+    started = time.time()
+    db_dir = ""
+    dirs: list[str] = []
+    try:
+        db_dir = auto_detect_db_dir() or ""
+        dirs = list_account_dirs(db_dir)
+    except Exception as exc:        # 找不到目录时交给 WeChatDB 自己报错
+        log.debug("定位微信数据目录失败：%r", exc)
+
+    account = resolve_account(wanted, dirs)
+    if wanted and not account:
+        raise RuntimeError(
+            f"配置里锁定的微信账号「{wanted}」对不上任何账号目录。"
+            f"本机现有：{'、'.join(dirs) or '（没找到任何账号目录）'}。"
+            "wx_account 只认 wxid 或账号目录名（启动日志里会打印），昵称不行。")
+
+    kwargs = {}
+    if db_dir:
+        kwargs["db_dir"] = db_dir
+    if account:
+        kwargs["account"] = account
+    beat = _heartbeat("打开微信数据库")
+    try:
+        db = WeChatDB(**kwargs)
+    finally:
+        beat.set()
+    info = db.get_self_info()
+
+    nick = info.get("nick_name") or ""
+    wxid = info.get("username") or ""
+    log.info("微信数据库就绪（%.1fs）：%s（%s）", time.time() - started,
+             nick or "?", wxid or "?")
+
+    others = [d for d in dirs if d != getattr(db, "account", "")]
+    if account:
+        if others:
+            log.info("已锁定微信账号：%s；忽略另外 %d 个账号目录（%s）",
+                     db.account, len(others), "、".join(others))
+        else:
+            log.info("已锁定微信账号：%s", db.account)
+    elif len(dirs) > 1:
+        log.warning(
+            "检测到 %d 个微信账号目录（%s），当前自动选了 %s。"
+            "同时登着两个微信时请在 config.json 里填 wx_account 锁定，"
+            "否则可能读到另一个账号的聊天、或者启动时重算密钥卡很久。",
+            len(dirs), "、".join(dirs), getattr(db, "account", "?"))
+    return db, info
+
+
+def _window_rect(hwnd: int):
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        r = wt.RECT()
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            return 0, 0, 0, 0
+        return int(r.left), int(r.top), int(r.right), int(r.bottom)
+    except Exception:
+        return 0, 0, 0, 0
+
+
+def _window_pid(hwnd: int) -> int:
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        pid = wt.DWORD(0)
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value)
+    except Exception:
+        return 0
+
+
+def _is_window(hwnd: int) -> bool:
+    try:
+        import ctypes
+
+        return bool(hwnd) and bool(ctypes.windll.user32.IsWindow(hwnd))
+    except Exception:
+        return False
+
+
+def wechat_windows() -> list[dict]:
+    """当前可见的微信主窗口，按面积从大到小：{hwnd, pid, w, h}。
+
+    直接用底层库自己的筛选（标题像主窗 + 加载了 Weixin.dll），
+    保证和我们一会儿要钉的窗口是同一批，不会出现「选到一个发不了消息的窗口」。
+    """
+    try:
+        from wechatauto.uia_driver import WeChatUIA
+
+        hwnds = WeChatUIA()._wechat_hwnds()
+    except Exception as exc:
+        log.debug("枚举微信窗口失败：%r", exc)
+        return []
+
+    out = []
+    for hwnd in hwnds:
+        left, top, right, bottom = _window_rect(hwnd)
+        out.append({
+            "hwnd": int(hwnd),
+            "pid": _window_pid(hwnd),
+            "w": max(0, right - left),
+            "h": max(0, bottom - top),
+        })
+    out.sort(key=lambda w: w["w"] * w["h"], reverse=True)
+    return out
+
+
+def _processes_using(path: str) -> list[int]:
+    """哪些进程打开着这个文件（Windows Restart Manager，不需要管理员）。
+
+    多开微信时每个账号是独立进程，靠「谁开着这个账号的 message.db」就能把
+    账号和窗口对上。系统不让查（沙箱/精简系统）时返回空列表，调用方退回启发式。
+    """
+    import ctypes
+    import ctypes.wintypes as wt
+
+    class _UNIQUE_PROCESS(ctypes.Structure):
+        _fields_ = [("dwProcessId", wt.DWORD), ("ProcessStartTime", wt.FILETIME)]
+
+    class _PROCESS_INFO(ctypes.Structure):
+        _fields_ = [
+            ("Process", _UNIQUE_PROCESS),
+            ("strAppName", wt.WCHAR * 256),
+            ("strServiceShortName", wt.WCHAR * 64),
+            ("ApplicationType", ctypes.c_int),
+            ("AppStatus", wt.ULONG),
+            ("TSSessionId", wt.DWORD),
+            ("bRestartable", wt.BOOL),
+        ]
+
+    try:
+        lib = ctypes.WinDLL("rstrtmgr")
+        lib.RmStartSession.argtypes = [ctypes.POINTER(wt.DWORD), wt.DWORD, wt.LPWSTR]
+        lib.RmStartSession.restype = wt.DWORD
+        session = wt.DWORD(0)
+        key = ctypes.create_unicode_buffer(33)      # CCH_RM_SESSION_KEY + 1
+        if lib.RmStartSession(ctypes.byref(session), 0, key) != 0:
+            return []
+        try:
+            names = (wt.LPCWSTR * 1)(path)
+            if lib.RmRegisterResources(session, 1, names, 0, None, 0, None) != 0:
+                return []
+            needed = wt.UINT(0)
+            have = wt.UINT(0)
+            reasons = wt.DWORD(0)
+            rc = lib.RmGetList(
+                session, ctypes.byref(needed), ctypes.byref(have),
+                None, ctypes.byref(reasons))
+            if rc not in (0, 234) or not needed.value:      # 234 = MORE_DATA
+                return []
+            buf = (_PROCESS_INFO * needed.value)()
+            have = wt.UINT(needed.value)
+            if lib.RmGetList(session, ctypes.byref(needed), ctypes.byref(have),
+                             buf, ctypes.byref(reasons)) != 0:
+                return []
+            return [int(buf[i].Process.dwProcessId) for i in range(have.value)]
+        finally:
+            lib.RmEndSession(session)
+    except Exception as exc:
+        log.debug("查文件占用失败（%s）：%r", os.path.basename(path), exc)
+        return []
+
+
+def account_window_pid(account_dir: str) -> int:
+    """这个账号的库正被哪个进程打开；查不到返回 0。"""
+    if not account_dir:
+        return 0
+    base = os.path.join(account_dir, "db_storage")
+    files = []
+    try:
+        for root, _dirs, names in os.walk(base):
+            for name in names:
+                if name.endswith(".db") and not name.endswith(("-wal", "-shm")):
+                    files.append(os.path.join(root, name))
+    except OSError:
+        return 0
+    # 消息库最常被写，先查它；再逐个试，命中就停
+    files.sort(key=lambda p: 0 if "message" in p.lower() else 1)
+    for path in files[:8]:
+        pids = _processes_using(path)
+        if pids:
+            return pids[0]
+    return 0
+
+
+def pick_send_window(cfg: Config, db=None) -> int:
+    """挑一个发送窗口，返回 hwnd（0 = 交给底层库自己找）。
+
+    优先级：配置里的 wx_hwnd > 只有一个窗口就用它 > 按「谁开着这个账号的库」
+    匹配进程 > 面积最大的那个（并在日志里说清楚为什么不确定）。
+    """
+    wins = wechat_windows()
+    if not wins:
+        return 0
+
+    pinned = int(getattr(cfg, "wx_hwnd", 0) or 0)
+    if pinned:
+        hit = [w for w in wins if w["hwnd"] == pinned]
+        if hit:
+            log.info("发送窗口：按 wx_hwnd 锁定 hwnd=%s（pid=%s）",
+                     pinned, hit[0]["pid"])
+            return pinned
+        log.warning("配置的 wx_hwnd=%s 不是当前可见的微信窗口（可能微信重开过），"
+                    "改为自动选择", pinned)
+
+    if len(wins) == 1:
+        log.info("发送窗口：hwnd=%s（pid=%s，只有一个微信窗口）",
+                 wins[0]["hwnd"], wins[0]["pid"])
+        return wins[0]["hwnd"]
+
+    pid = account_window_pid(getattr(db, "account_dir", "") or "")
+    if pid:
+        hit = [w for w in wins if w["pid"] == pid]
+        if len(hit) == 1:
+            log.info("发送窗口：hwnd=%s（pid=%s，账号 %s 的数据库由它打开）",
+                     hit[0]["hwnd"], pid, getattr(db, "account", "?"))
+            return hit[0]["hwnd"]
+
+    log.warning(
+        "检测到 %d 个微信窗口（%s），但没法确认哪个是账号 %s 的，"
+        "先按面积最大的那个发。若发现回错了号，请用 --wx-list 看窗口，"
+        "把对应 hwnd 填进 config.json 的 wx_hwnd。",
+        len(wins), "、".join(f"hwnd={w['hwnd']}/pid={w['pid']}" for w in wins),
+        getattr(db, "account", "?") or "?")
+    return wins[0]["hwnd"]
+
+
+def pin_uia_window(gui, hwnd: int) -> None:
+    """让 UIA 引擎只认这一个窗口。
+
+    guia 用 hwnd 算坐标，但 uia_driver 每次会自己重扫所有微信窗口、取面积
+    最大的那个。多开时两者可能不是同一个窗口 —— 表现为「当前会话看着对，
+    消息粘到了另一个微信里」。这里把引擎的窗口列表固定成我们选的那一个。
+    """
+    if not hwnd or gui is None:
+        return
+    original = getattr(gui, "_get_uia", None)
+    if original is None:
+        return
+
+    def _get(refresh: bool = False):
+        eng = original(refresh)
+        if eng is not None and getattr(eng, "_dsh_pinned_hwnd", None) != hwnd:
+            scan = eng._wechat_hwnds
+
+            def _only(diag=None):
+                hits = scan(diag)
+                return [hwnd] if _is_window(hwnd) else hits
+
+            eng._wechat_hwnds = _only
+            eng._dsh_pinned_hwnd = hwnd
+        return eng
+
+    with _HWND_PIN_LOCK:
+        gui._get_uia = _get
+
+
+def wx_list(cfg: Config) -> int:
+    """--wx-list：打印微信窗口和账号目录，方便手工锁定。"""
+    from wechatauto.db import auto_detect_db_dir
+
+    db_dir = ""
+    dirs: list[str] = []
+    try:
+        db_dir = auto_detect_db_dir() or ""
+        dirs = list_account_dirs(db_dir)
+    except Exception as exc:
+        print(f"定位微信数据目录失败：{exc}")
+
+    print(f"微信数据目录：{db_dir or '（没找到）'}")
+    print("账号目录：")
+    if not dirs:
+        print("  （没有）")
+    for name in dirs:
+        print(f"  {name}")
+
+    print()
+    print("微信窗口：")
+    wins = wechat_windows()
+    if not wins:
+        print("  （没有可见的微信主窗口 —— 先把微信登录好）")
+    for i, w in enumerate(wins, 1):
+        print(f"  [{i}] hwnd={w['hwnd']}  pid={w['pid']}  {w['w']}x{w['h']}")
+
+    if len(wins) > 1 and dirs:
+        print()
+        print("账号 → 窗口（按「谁打开着这个账号的数据库」判断）：")
+        for name in dirs:
+            pid = account_window_pid(os.path.join(db_dir, name))
+            hwnds = [w["hwnd"] for w in wins if w["pid"] == pid] if pid else []
+            mark = f"hwnd={hwnds[0]}" if hwnds else "（查不到）"
+            print(f"  {name} → pid={pid or '?'} {mark}")
+
+    print()
+    print("要锁定：把 wx_account 设成上面的账号目录名（或 wxid）；")
+    print("窗口不听话时再把 wx_hwnd 设成对应 hwnd。")
+    return 0
+
+
 # ────────────────────────────── 机器人 ──────────────────────────────
 
 
@@ -239,6 +654,7 @@ class Bot:
         self._search_limiter = RateLimiter(cfg.web_search_per_hour)
 
         self._wx = None                 # wechatauto.WeChat，首次发送时才创建
+        self._wx_hwnd = 0               # 实际使用的微信主窗口句柄
         self._wx_lock = threading.Lock()
         # 所有 UIA/键鼠动作走这一个线程（COM 对象与线程绑定，见 _sender_loop）
         self._task_q: queue.Queue = queue.Queue()
@@ -261,6 +677,12 @@ class Bot:
         self._recent_images: dict[str, list] = {}
         self._vision_limiter = RateLimiter(cfg.vision_max_per_hour)
         self._media = None
+        self._img_lock = threading.Lock()    # 同一时间只取一张图（取图可能卡在等密钥）
+        # 看门狗：哪条消息从「开始想」到现在还没发出去（排查「不回消息」）
+        self._inflight: dict[str, float] = {}
+        self._stuck_logged: dict[str, float] = {}
+        self._active = 0                     # 正在回消息的条数，后台维护要避让
+        self._last_msg_at = 0.0
         base = os.path.dirname(os.path.abspath(cfg.memory_file)) if cfg.memory_file else os.getcwd()
         self._img_dir = os.path.join(base, "_images")
 
@@ -272,10 +694,19 @@ class Bot:
         with self._wx_lock:
             if self._wx is None:
                 from wechatauto import WeChat
+                from wechatauto.guia import WeChatGUI
+
                 log.info("正在初始化微信窗口控制器…")
+                hwnd = pick_send_window(self.cfg, self.db) if self.db is not None else 0
+                gui = WeChatGUI(hwnd=hwnd) if hwnd else WeChatGUI()
+                self._wx_hwnd = gui.main_hwnd
                 # 复用同一个 WeChatDB 实例，省掉一次数据库解密
-                self._wx = WeChat(db=self.db) if self.db is not None else WeChat()
-                log.info("微信控制器就绪（账号：%s）", self._wx.nickname)
+                wx = WeChat(gui=gui, db=self.db) if self.db is not None else WeChat(gui=gui)
+                # 坐标和 UIA 必须是同一个窗口，否则多开时会「看着这个、发到那个」
+                pin_uia_window(gui, gui.main_hwnd)
+                self._wx = wx
+                log.info("微信控制器就绪（账号：%s，窗口：hwnd=%s）",
+                         self._wx.nickname, gui.main_hwnd)
         return self._wx
 
     def resolve_name(self, chat_id: str) -> str:
@@ -331,10 +762,17 @@ class Bot:
 
     def send(self, chat_id: str, text: str) -> bool:
         """发文本；多行会拆成几条发出去，[表情:xxx] 换成图片。"""
+        # 兜底：模型偶尔会带回 HTML（线上真发过 <div style="text-align: center"></div>），
+        # 这里再清一遍，避免绕过 on_message 的调用（主动插话、道歉、好感度）漏掉
+        text = clean_reply(text)
         text, sticker_names = extract_stickers(text)
         # 兜底：调用方（比如主动插话）如果漏了抠标签，别把 [好感:+3] 这种发出去
         for extractor in (extract_notes, extract_moments, extract_affinity, extract_kaomoji):
             text = extractor(text)[0]
+        # 模型自己发明的标签（[想念:...]、【心情：...】）也删掉，别发进聊天
+        text, unknown = strip_unknown_tags(text)
+        if unknown:
+            log.warning("回复里有协议外的标签 %s，已删掉", "、".join(unknown))
         if self.cfg.reply_split:
             chunks = split_messages(text, TEXT_LIMIT, self.cfg.reply_split_max)
         else:
@@ -621,18 +1059,46 @@ class Bot:
         return picked
 
     def _download_image(self, chat_id: str, rec: dict):
-        """把图片从微信本地库里解出来，返回落盘路径；失败返回 None。"""
-        try:
-            from wechatauto import MediaDownloader
+        """把图片从微信本地库里解出来，返回落盘路径；失败或超时返回 None。
 
-            if self._media is None:
-                os.makedirs(self._img_dir, exist_ok=True)
-                self._media = MediaDownloader(self.db, save_dir=self._img_dir)
-            path = self._media.download_image(
-                chat_id, rec.get("local_id"), tier="best", shard=rec.get("shard"))
-        except Exception as exc:
-            log.warning("图片下载异常 %s/%s：%r", chat_id, rec.get("local_id"), exc)
+        取图那一步可能在「等你点开大图、抓 AES 密钥」上卡最多 120 秒
+        （wechatauto 的 monitor 逻辑）。卡住的正好是回复线程，表现就是
+        「有人发了图之后就不说话了」。所以这里限时：超过 IMAGE_FETCH_WAIT
+        这一轮就不看图，先回文字；后台那次取图继续跑，密钥抓到以后就快了。
+        """
+        if not self._img_lock.acquire(blocking=False):
+            log.debug("上一张图还在取（多半在等密钥），这条先不看图")
             return None
+        box: dict = {}
+        done = threading.Event()
+
+        def _work():
+            try:
+                from wechatauto import MediaDownloader
+
+                if self._media is None:
+                    os.makedirs(self._img_dir, exist_ok=True)
+                    self._media = MediaDownloader(self.db, save_dir=self._img_dir)
+                box["path"] = self._media.download_image(
+                    chat_id, rec.get("local_id"), tier="best", shard=rec.get("shard"))
+            except Exception as exc:
+                box["error"] = exc
+            finally:
+                self._img_lock.release()
+                done.set()
+
+        threading.Thread(target=_work, name="wx-img", daemon=True).start()
+        if not done.wait(IMAGE_FETCH_WAIT):
+            log.warning("取图超过 %.0f 秒（多半在等图片密钥）%s/%s，这一轮先不看图；"
+                        "在微信里点开一张大图看几秒，密钥抓到就好了",
+                        IMAGE_FETCH_WAIT, chat_id, rec.get("local_id"))
+            return None
+
+        if box.get("error") is not None:
+            log.warning("图片下载异常 %s/%s：%r", chat_id, rec.get("local_id"),
+                        box["error"])
+            return None
+        path = box.get("path")
 
         if not path:
             log.warning(
@@ -898,6 +1364,15 @@ class Bot:
 
     def maintain(self) -> None:
         """定时维护，跑在后台线程里，不阻塞收发。"""
+        # 正在回消息、或者刚聊完，就把这一轮让出去：摘要/反思都要调模型，
+        # 跟聊天抢 API 只会让回复变慢（用户看到的就是「刚启动不回消息」）。
+        if self._active:
+            log.debug("跳过本轮维护：还有 %d 条回复在处理", self._active)
+            return
+        if self._last_msg_at and time.time() - self._last_msg_at < 90:
+            log.debug("跳过本轮维护：%.0f 秒前还在聊天",
+                      time.time() - self._last_msg_at)
+            return
         if not self._maint_lock.acquire(blocking=False):
             return          # 上一轮还没跑完
         try:
@@ -911,6 +1386,24 @@ class Bot:
                 log.warning("记忆反思异常：%r", exc)
         finally:
             self._maint_lock.release()
+
+    def watchdog(self) -> None:
+        """有回复卡住超过 90 秒就在日志里点名。
+
+        「刚启动不回消息」最难查的地方在于：卡住的时候日志什么都不写。
+        这里把「开始想 → 发出去」这段时间记下来，超时打一条 warning，
+        下次看日志就知道是卡在模型还是卡在发送。
+        """
+        now = time.time()
+        for chat_id, since in list(self._inflight.items()):
+            waited = now - since
+            if waited < 90:
+                continue
+            if now - self._stuck_logged.get(chat_id, 0) < 120:
+                continue        # 同一个会话 2 分钟内只提醒一次
+            self._stuck_logged[chat_id] = now
+            log.warning("%s 这条回复已经等了 %.0f 秒还没发出去"
+                        "（卡在模型请求或微信发送上），继续等…", chat_id, waited)
 
     def _summarize_idle(self) -> None:
         """把闲置的会话压成 1~2 句摘要，存进那个人的档案。"""
@@ -961,6 +1454,7 @@ class Bot:
 
     def on_message(self, msg: dict, _listener=None) -> None:
         chat_id = str(msg.get("username") or "")
+        self._last_msg_at = time.time()
         # 记一下上一条是什么时候：主动接话时用它判断「这个群冷清多久了」
         prev_at = self._last_in.get(chat_id)
         self._last_in[chat_id] = time.time()
@@ -999,66 +1493,86 @@ class Bot:
             self._send_affinity(chat_id, self._profile_key(chat_id, msg))
             return
 
-        speaker = self.resolve_sender(chat_id, msg)
-        developer = self.is_developer(chat_id, msg, speaker)
-        person = self._remember_who(chat_id, msg, speaker)   # 长期记忆：先落档
-        image_url = self._grab_image(chat_id, person) if self.cfg.vision_enabled else None
-        tools = [WEB_SEARCH_TOOL] if self.cfg.web_search_enabled else None
-        runner = (lambda n, a: self._run_tool(person, n, a)) if tools else None
         started = time.time()
+        # 从「开始处理」到「发出去」都算在处理中：看门狗据此发现卡住的回复
+        # （识图下载、模型请求、微信发送都可能卡），后台维护据此避让。
+        self._active += 1
+        self._inflight[chat_id] = started
         try:
-            messages = self.sessions.build(
-                chat_id, d.text, speaker, developer, person, image_url)
-            # 带图这一轮换视觉模型；纯文字用默认模型
-            answer = self.llm.chat(
-                messages,
-                model=self.cfg.vision_model if image_url else None,
-                tools=tools,
-                tool_runner=runner)
-        except DeepSeekError as exc:
-            log.error("DeepSeek 失败 %s：%s", chat_id, exc)
-            self._apologize(chat_id)
-            return
-        except Exception as exc:
-            log.exception("调用异常 %s：%r", chat_id, exc)
-            self._apologize(chat_id)
-            return
+            speaker = self.resolve_sender(chat_id, msg)
+            developer = self.is_developer(chat_id, msg, speaker)
+            person = self._remember_who(chat_id, msg, speaker)   # 长期记忆：先落档
+            image_url = self._grab_image(chat_id, person) if self.cfg.vision_enabled else None
+            tools = [WEB_SEARCH_TOOL] if self.cfg.web_search_enabled else None
+            runner = (lambda n, a: self._run_tool(person, n, a)) if tools else None
+            try:
+                messages = self.sessions.build(
+                    chat_id, d.text, speaker, developer, person, image_url)
+                # 带图这一轮换视觉模型；纯文字用默认模型
+                answer = self.llm.chat(
+                    messages,
+                    model=self.cfg.vision_model if image_url else None,
+                    tools=tools,
+                    tool_runner=runner)
+            except DeepSeekError as exc:
+                log.error("DeepSeek 失败 %s：%s", chat_id, exc)
+                self._apologize(chat_id)
+                return
+            except Exception as exc:
+                log.exception("调用异常 %s：%r", chat_id, exc)
+                self._apologize(chat_id)
+                return
 
-        # 模型可能在回复里夹带 [记住:xxx]，抠出来存进**说话人**的档案，别让它出现在聊天里
-        answer, notes = extract_notes(answer)
-        if notes:
-            added = self.sessions.add_traits(person, notes)
-            if added:
-                log.info("记住 %s 的印象 %d 条：%s", person, added, "、".join(notes))
+            # 模型偶尔会夹带 HTML。线上真发生过：整条只回一个
+            # <div style="text-align: center"></div>，然后被原样发了出去。
+            cleaned = clean_reply(answer)
+            if cleaned != answer:
+                log.info("回复里夹带了 HTML，已清理：%s",
+                         (answer.strip()[:60] or "（整条都是标签）").replace("\n", " "))
+                answer = cleaned
 
-        # [回忆:那一刻] → 记进「瞬间记忆」（是感受，不是事实）
-        answer, moments = extract_moments(answer)
-        for m in moments:
-            if self.sessions.add_moment(person, m):
-                log.info("瞬间记忆 %s：%s", person, m)
+            # 模型可能在回复里夹带 [记住:xxx]，抠出来存进**说话人**的档案，别让它出现在聊天里
+            answer, notes = extract_notes(answer)
+            if notes:
+                added = self.sessions.add_traits(person, notes)
+                if added:
+                    log.info("记住 %s 的印象 %d 条：%s", person, added, "、".join(notes))
 
-        # [好感:+3 被夸] → 调分。单次/每日上限都在 bump_affinity 里卡死
-        answer, affs = extract_affinity(answer)
-        for delta, why in affs:
-            score = self.sessions.bump_affinity(person, delta, why)
-            tier, _ = tier_of(score)
-            log.info("好感 %s %+d → %d（%s）%s",
-                     person, delta, score, tier, ("·" + why) if why else "")
-        # [颜:开心] → 按概率 + 冷却决定要不要真贴一个颜文字
-        answer, mood = extract_kaomoji(answer)
-        answer = self._maybe_kaomoji(chat_id, answer, mood)
+            # [回忆:那一刻] → 记进「瞬间记忆」（是感受，不是事实）
+            answer, moments = extract_moments(answer)
+            for m in moments:
+                if self.sessions.add_moment(person, m):
+                    log.info("瞬间记忆 %s：%s", person, m)
 
-        if not answer:
-            log.info("这条回复只有 [记住:...]，没有正文，不发送")
-            return
+            # [好感:+3 被夸] → 调分。单次/每日上限都在 bump_affinity 里卡死
+            answer, affs = extract_affinity(answer)
+            for delta, why in affs:
+                score = self.sessions.bump_affinity(person, delta, why)
+                tier, _ = tier_of(score)
+                log.info("好感 %s %+d → %d（%s）%s",
+                         person, delta, score, tier, ("·" + why) if why else "")
+            # [颜:开心] → 按概率 + 冷却决定要不要真贴一个颜文字
+            answer, mood = extract_kaomoji(answer)
+            # 协议外的标签（模型自己发明的 [想念:...] 之类）不能当正文发出去
+            answer, unknown = strip_unknown_tags(answer)
+            if unknown:
+                log.warning("模型发明了协议外的标签 %s，已删掉", "、".join(unknown))
+            answer = self._maybe_kaomoji(chat_id, answer, mood)
 
-        hist = format_user_content(self.cfg, chat_id, d.text, speaker)
-        self.sessions.append(chat_id, hist + ("（附图）" if image_url else ""), answer, person)
-        who_tag = "，".join(filter(None, [speaker, "开发者" if developer else ""]))
-        log.info("回答 %s%s（%.1fs，%d 字）",
-                 chat_id, f"（{who_tag}）" if who_tag else "",
-                 time.time() - started, len(answer))
-        self.send(chat_id, answer)
+            if not answer:
+                log.info("这条回复没有可发的正文（只剩标签），不发送")
+                return
+
+            hist = format_user_content(self.cfg, chat_id, d.text, speaker)
+            self.sessions.append(chat_id, hist + ("（附图）" if image_url else ""), answer, person)
+            who_tag = "，".join(filter(None, [speaker, "开发者" if developer else ""]))
+            log.info("回答 %s%s（%.1fs，%d 字）",
+                     chat_id, f"（{who_tag}）" if who_tag else "",
+                     time.time() - started, len(answer))
+            self.send(chat_id, answer)
+        finally:
+            self._active -= 1
+            self._inflight.pop(chat_id, None)
 
 
 # ─────────────────────────── 自检 ───────────────────────────
@@ -1078,10 +1592,7 @@ def run_check(cfg: Config) -> int:
 
     print("2) 检查微信数据库 …")
     try:
-        from wechatauto.db import WeChatDB
-
-        db = WeChatDB()
-        info = db.get_self_info()
+        db, info = open_wechat_db(cfg)      # 同样受 wx_account 约束
         print(f"   ✅ 账号：{info.get('nick_name')}（{info.get('username')}）")
         sessions = db.get_sessions(limit=10)
         print(f"   ✅ 读到 {len(sessions)} 个会话（示例）：")
@@ -1091,6 +1602,7 @@ def run_check(cfg: Config) -> int:
         ok = False
         print(f"   ❌ 失败：{exc!r}")
         print("      常见原因：微信没登录 / Python 不是 64 位 / 微信版本低于 4.1.12")
+        print("      多开微信时用 --wx-list 看账号目录，填到 config.json 的 wx_account")
 
     print("3) 检查识图 …")
     if not cfg.vision_enabled:
@@ -1139,6 +1651,8 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="自检后退出")
     parser.add_argument("--dry-run", action="store_true", help="只听不回")
     parser.add_argument("--chat", action="append", default=[], help="只监听指定会话（可多次）")
+    parser.add_argument("--wx-list", action="store_true",
+                        help="列出微信账号目录和窗口（多开时用来锁定）")
     args = parser.parse_args()
 
     if not os.path.exists(args.config):
@@ -1148,6 +1662,10 @@ def main() -> int:
 
     cfg = load_config(args.config)
     setup_logging(cfg)
+
+    if args.wx_list:
+        return wx_list(cfg)
+
     apply_rhythm(cfg)          # 拟人节流：默认关，否则每次动作要等 2.5~6 秒
 
     # --check 即使没配 key 也要跑，好让人看到微信那两项的状态
@@ -1163,7 +1681,7 @@ def main() -> int:
 
     # 坑：wechatauto 根包导出的 Listener 是 wx.py 里的抽象基类（没有 __init__），
     # 真正的轮询监听器在 wechatauto.db 里。所以这两个都从 db 模块导。
-    from wechatauto.db import Listener, WeChatDB
+    from wechatauto.db import Listener
 
     if cfg.wx_debug:
         from wechatauto import wxlog
@@ -1172,8 +1690,27 @@ def main() -> int:
 
     patch_image_paste(cfg.image_paste_wait)
 
-    db = WeChatDB()
-    info = db.get_self_info()
+    # 同一个微信号只跑一个实例：两个实例会抢同一个窗口和同一份监听水位。
+    # 放在开库之前，免得第二个实例先去重算一遍密钥再发现跑不了。
+    mutex_key = (cfg.wx_account or "default").strip().lower()
+    if not acquire_single_instance(mutex_key):
+        log.error("同一个微信号已经有机器人在跑了，本次启动退出")
+        print("\n已经有一个机器人进程在跑这个微信号了。")
+        print("两个实例会抢同一个微信窗口（表现：消息时回时不回），先关掉那个再启动。")
+        return 1
+
+    # 打开数据前先打好日志：多开微信选错账号时，这一步会重算密钥、
+    # 卡好几分钟，日志里要能看出来是卡在这儿。
+    log.info("正在打开微信数据库%s…",
+             f"（锁定账号 {cfg.wx_account}）" if cfg.wx_account else "")
+    try:
+        db, info = open_wechat_db(cfg)
+    except Exception as exc:
+        log.error("打开微信数据库失败：%s", exc)
+        print(f"\n打开微信数据库失败：{exc}")
+        print("可以先跑一下： run.cmd --wx-list  看本机有哪些账号目录")
+        return 1
+
     bot = Bot(cfg, db=db, dry_run=args.dry_run)
     bot.self_wxid = info.get("username") or ""
     nick = info.get("nick_name") or bot.self_wxid
@@ -1187,6 +1724,16 @@ def main() -> int:
     log.info("人设：%s（%d 字）",
              cfg.system_prompt_file or "config.json 里的 system_prompt",
              len(cfg.system_prompt))
+
+    # 模型会自己发明标签：该写 [回忆:] 时写成 [想念:]，程序不认识就发进聊天了。
+    # 明确告诉它只有这五个，别的不存在（程序侧还有 strip_unknown_tags 兜底）。
+    cfg.system_prompt += (
+        "\n\n## 标签协议（必须遵守）\n"
+        "回复里只允许这五个标签：`[记住:内容]`、`[好感:N]`、`[回忆:一句话]`、"
+        "`[颜:情绪]`、`[表情:名字]`。\n"
+        "不许发明别的标签（比如 `[想念:]`、`[心情:]`、`[印象:]`）——"
+        "程序不认识它们，会直接删掉。"
+    )
 
     # 告诉模型有哪些表情可用，否则它只能瞎猜关键词
     stickers = list_stickers(cfg.sticker_dir)
@@ -1230,6 +1777,7 @@ def main() -> int:
         log.info("清理识图临时图片 %d 张（保留 %d 天 / 最多 %d 张）",
                  dropped, cfg.image_keep_days, cfg.image_keep_max)
 
+    t_listen = time.time()
     listener = Listener(db, interval=1.0)
     if args.chat:
         for chat_id in args.chat:
@@ -1237,19 +1785,21 @@ def main() -> int:
             log.info("监听指定会话：%s", chat_id)
     else:
         listener.add_all(bot.on_message, discover=True)
-        log.info("监听全部会话（自动发现新会话）")
+        log.info("监听全部会话（自动发现新会话）：%d 个", len(listener.watermark))
 
     listener.start()
-    log.info("已启动，Ctrl+C 退出")
+    log.info("已启动，Ctrl+C 退出（监听就绪 %.1fs）", time.time() - t_listen)
 
     if cfg.summary_enabled:
         log.info("会话摘要：闲置 %d 秒后压缩（每人留 %d 条）",
                  cfg.summary_after, cfg.summary_keep)
     if cfg.reflect_enabled:
         log.info("记忆反思：每 %d 小时一次", cfg.reflect_hours)
+    log.info("后台维护：聊天时自动跳过，闲下来才跑摘要/反思")
 
     next_cleanup = time.time() + 3600       # 每小时清一次识图临时文件
     next_maint = time.time() + 60           # 启动 1 分钟后先跑一轮摘要/反思
+    next_watch = time.time() + 15           # 看门狗：发现卡住的回复
     try:
         while True:
             time.sleep(1)
@@ -1258,6 +1808,9 @@ def main() -> int:
                 dropped = bot.cleanup_images()
                 if dropped:
                     log.info("清理识图临时图片 %d 张", dropped)
+            if time.time() >= next_watch:
+                next_watch = time.time() + 15
+                bot.watchdog()
             if time.time() >= next_maint:
                 next_maint = time.time() + 300
                 threading.Thread(target=bot.maintain, name="wx-maint",
