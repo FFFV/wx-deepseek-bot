@@ -8,4 +8,10 @@ Pillow>=10.0
 
 # 可选：微信 4.x 的图片常是 .wxgf（HEVC 容器），识图前要先转成 jpg。
 # 装了会自动发现 ffmpeg；不装则遇到 .wxgf 时只能跳过（不影响文字聊天）。
+# 发语音条也用得上它：在线引擎（breeze/edge）返回的 mp3 得靠它转成 wav。
 # imageio-ffmpeg>=0.4.9
+
+# 可选：语音条（发语音）的在线合成引擎，装了哪个 auto 就用哪个，都不装退回系统自带中文语音。
+# breeze-blue 需要 Python 3.10+，按字扣费，要 API key；edge-tts 免费、不用 key。
+# breeze-blue>=0.22
+# edge-tts>=6.1

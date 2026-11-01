@@ -73,12 +73,16 @@ from brain import (  # noqa: E402
     pick_kaomoji,
     render_dialogue,
     resolve_sticker,
+    should_voice,
+    speakable,
     split_messages,
     split_text,
     strip_sender_prefix,
     strip_unknown_tags,
     tier_of,
 )
+
+import voice as voice_lib  # noqa: E402  合成 + 定点播放（winmm waveOut）
 
 log = logging.getLogger("wxbot")
 
@@ -225,6 +229,158 @@ def prune_images(img_dir: str, keep_days: int = 7, keep_max: int = 200,
             except OSError:
                 pass
     return removed
+
+
+def prune_voice(voice_dir: str, keep_days: int = 3, keep_max: int = 50,
+                now: float | None = None) -> int:
+    """清理合成语音留下的 wav，返回删掉的个数。
+
+    正常情况下发完就删（见 Bot._send_voice）；剩下的都是「合成成功但发送失败」
+    或中途退出的残留，外加一堆 0 字节的空文件。不清的话会一直堆在 _voice/ 里。
+    """
+    try:
+        names = os.listdir(voice_dir)
+    except OSError:
+        return 0            # 还没发过语音
+
+    now = time.time() if now is None else now
+    alive: list[tuple[float, str]] = []
+    removed = 0
+    for name in names:
+        if not name.lower().endswith((".wav", ".mp3")):
+            continue
+        path = os.path.join(voice_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        try:
+            if os.path.getsize(path) < 1000:    # 合成失败留下的空壳（几个字节），没任何用
+                os.remove(path)
+                removed += 1
+                continue
+        except OSError:
+            pass
+        if now - mtime > keep_days * 86400:
+            try:
+                os.remove(path)
+                removed += 1
+                continue
+            except OSError:
+                pass
+        alive.append((mtime, path))
+
+    if keep_max > 0 and len(alive) > keep_max:
+        alive.sort()
+        for _mtime, path in alive[: len(alive) - keep_max]:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+# ─────────────────── 识图：把图片密钥存下来 ───────────────────
+# 图片是加密的，密钥只能从 WeChat 进程内存里那一小块 cfg 结构派生出来
+# （cfg_dword + wxid 算 md5）。实测这个过程**时灵时不灵**：同一台机器上
+# 10-31 18:19 能派生、17:58 就派生不出来，只能退回「你在微信里点开一张大图
+# 让我抓密钥」的慢路径。更麻烦的是派生的结果从来不落盘，于是每次重启都要
+# 重新赌一次运气。
+#
+# 这里补上：派生成功就存到 _images/image_key.json，下次启动先读它，
+# 校验（拿真实 .dat 反解一次）通过就直接用，不再依赖内存扫描。
+
+IMAGE_KEY_FILE = "image_key.json"
+
+
+def read_saved_image_key(img_dir: str) -> str:
+    """读磁盘上存过的图片 AES 密钥（没有就返回空串）。"""
+    path = os.path.join(img_dir, IMAGE_KEY_FILE)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError):
+        return ""
+    return str(data.get("aes") or "")
+
+
+def save_image_key(img_dir: str, aes_key: str, cfg_dword: int = 0) -> bool:
+    """把图片密钥存盘，返回是否写成。"""
+    if not aes_key:
+        return False
+    path = os.path.join(img_dir, IMAGE_KEY_FILE)
+    try:
+        os.makedirs(img_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"aes": aes_key, "cfg_dword": int(cfg_dword or 0)}, f, indent=2)
+        return True
+    except OSError as exc:
+        log.debug("存图片密钥失败：%r", exc)
+        return False
+
+
+def ensure_image_key(db, img_dir: str) -> str:
+    """确保能拿到图片密钥，返回 AES 密钥（拿不到返回空串）。
+
+    顺序：磁盘上存过的（先用真实密文校验）→ 从 db.cfg_dword 派生 → 失败。
+    派生成功就落盘，下次不用再赌内存扫描。
+    """
+    try:
+        from wechatauto import MediaDownloader
+    except Exception as exc:
+        log.debug("没装 wechatauto，跳过图片密钥检查：%r", exc)
+        return ""
+
+    try:
+        md = MediaDownloader(db, save_dir=img_dir)
+    except Exception as exc:
+        log.debug("构造 MediaDownloader 失败：%r", exc)
+        return ""
+
+    saved = read_saved_image_key(img_dir)
+    if saved:
+        try:
+            if md._validate_key(saved):
+                return saved
+            log.warning("存下的图片密钥校验没过（换账号/微信重装过？），重新派生")
+        except Exception as exc:
+            log.debug("校验存下的图片密钥失败：%r", exc)
+
+    # 库里自己也可能存过（「点开大图」慢路径抓到的），一并接管过来
+    try:
+        lib_key = md._load_persisted_key()
+    except Exception as exc:
+        log.debug("读库里的图片密钥失败：%r", exc)
+        lib_key = None
+    if lib_key:
+        save_image_key(img_dir, lib_key, getattr(db, "cfg_dword", 0) or 0)
+        log.info("图片密钥：沿用库里抓到的密钥（已存到 %s）",
+                 os.path.join(img_dir, IMAGE_KEY_FILE))
+        return lib_key
+
+    if not getattr(db, "cfg_dword", None):
+        log.warning("图片密钥：拿不到 cfg_dword（微信升级/权限/内存扫描失败），"
+                    "识图会走「等你点开大图」的慢路径")
+        return ""
+
+    try:
+        derived = md._derive_cfg_key()
+    except Exception as exc:
+        log.debug("派生图片密钥失败：%r", exc)
+        derived = None
+    if not derived:
+        log.warning("图片密钥：cfg_dword=%s 但派生/校验失败，识图可能用不了",
+                    getattr(db, "cfg_dword", None))
+        return ""
+
+    aes_key = derived[0]
+    if save_image_key(img_dir, aes_key, getattr(db, "cfg_dword", 0) or 0):
+        log.info("图片密钥：已从 cfg_dword 派生并存到 %s",
+                 os.path.join(img_dir, IMAGE_KEY_FILE))
+    return aes_key
 
 
 # ─────────────────── 多开微信：锁定账号、锁定窗口 ───────────────────
@@ -416,6 +572,69 @@ def _is_window(hwnd: int) -> bool:
         return bool(hwnd) and bool(ctypes.windll.user32.IsWindow(hwnd))
     except Exception:
         return False
+
+
+def restore_window(hwnd: int, gui=None) -> bool:
+    """把最小化 / 收进托盘的微信主窗口拉回来，返回「本来需要还原」与否。
+
+    为什么不能只靠库里的 ``ensure_visible()``：它带 15 秒缓存，窗口在缓存有效
+    期内被最小化的话它直接返回 True，不再碰窗口；接着 UIA 粘贴和回车就全打在
+    一个最小化的窗口上，消息静默发不出去（表现为「收到消息但不回」）。
+
+    三种「不见了」的形态都要处理：
+      · 最小化（IsIconic）→ SW_RESTORE
+      · 隐藏（点了关闭进托盘）→ SW_SHOW
+      · 没最小化但被挪到屏幕外（-32000 那种托盘停放位）→ 挪回可见区域
+    ``ShowWindow`` 对某些窗口不生效（返回 0 且状态不变），这时再借库里那套
+    ``bring_to_front()``（置顶 + 抢前台，带 AttachThreadInput）补一次。
+    """
+    if not hwnd:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    u = ctypes.windll.user32
+    h = ctypes.c_void_p(int(hwnd))
+    if not u.IsWindow(h):
+        return False
+
+    native = False
+    try:
+        if u.IsIconic(h):
+            u.ShowWindow(h, 9)          # SW_RESTORE
+            native = True
+        elif not u.IsWindowVisible(h):
+            u.ShowWindow(h, 5)          # SW_SHOW
+            native = True
+
+        rect = wintypes.RECT()
+        if u.GetWindowRect(h, ctypes.byref(rect)):
+            if rect.left <= -30000 or rect.top <= -30000:
+                u.ShowWindow(h, 5)
+                u.SetWindowPos(h, None, 120, 120, 0, 0, 0x0001 | 0x0040)  # NOSIZE|SHOWWINDOW
+                native = True
+    except Exception as exc:
+        log.debug("还原微信窗口失败：%r", exc)
+
+    if not native:
+        return False
+
+    time.sleep(0.35)
+    still_min = bool(u.IsIconic(h))
+    if still_min and gui is not None:
+        # ShowWindow 没拉动，交给库里的置顶/抢前台流程再试一次
+        try:
+            gui.bring_to_front(keep_topmost=False)
+            time.sleep(0.4)
+        except Exception as exc:
+            log.debug("bring_to_front 失败：%r", exc)
+        still_min = bool(u.IsIconic(h))
+
+    if still_min:
+        log.warning("微信窗口是最小化的，还原没成功（hwnd=%s）——消息可能发不出去", hwnd)
+        return True
+    log.info("微信窗口原先是最小化/收起的，已拉回来（hwnd=%s）", hwnd)
+    return True
 
 
 def wechat_windows() -> list[dict]:
@@ -637,6 +856,243 @@ def wx_list(cfg: Config) -> int:
     return 0
 
 
+# ────────────────────────────── 语音自检 ──────────────────────────────
+
+
+def voice_test(cfg: Config) -> int:
+    """--voice-test：声卡 → 合成 → 播放 → 找语音键，四步各自报结果。
+
+    前三步不需要微信；第四步要微信开着，找不到按钮时按提示跑 --probe-voice。
+    """
+    print("① 声卡")
+    outs = voice_lib.list_outputs()
+    for idx, name in outs:
+        print("   [%d] %s" % (idx, name))
+    device = voice_lib.find_output(cfg.voice_device)
+    if device is None:
+        print("   ✗ 没有「%s」：先装 VB-Cable（装完重新登录微信），"
+              "或把 config.json 的 voice_device 改成上面某台" % cfg.voice_device)
+        return 1
+    print("   ✓ 播到 %s" % voice_lib.hw_output_name(device))
+
+    print("② 合成（%s）" % cfg.voice_engine)
+    out_dir = os.path.join(os.getcwd(), "_voice")
+    try:
+        wav, used = voice_lib.speak(
+            "你好呀，我是小鲸鱼，测试一下声音。", out_dir, cfg.voice_engine,
+            rate=cfg.voice_rate, pitch=cfg.voice_pitch, voice_name=cfg.voice_name,
+            breeze_key=cfg.voice_breeze_key, breeze_voice=cfg.voice_breeze_voice)
+    except voice_lib.VoiceError as exc:
+        print("   ✗ %s" % exc)
+        print("   中文语音包：设置 → 时间和语言 → 语音 → 添加「中文(简体)」")
+        return 1
+    print("   ✓ 引擎 %s：%s（%.0f KB）" % (used, wav, os.path.getsize(wav) / 1024))
+
+    print("③ 播放（听得到/录音软件有电平就说明通了）")
+    try:
+        dur = voice_lib.play_wav(wav, device)
+    except voice_lib.VoiceError as exc:
+        print("   ✗ %s" % exc)
+        return 1
+    print("   ✓ %.1fs" % dur)
+
+    print("④ 录语音的方式")
+    if cfg.voice_key:
+        vk = voice_lib.vk_for(cfg.voice_key)
+        if vk is None:
+            print("   ✗ 不认识的快捷键：%r（支持 alt_r / ctrl_r / shift_r 等）" % cfg.voice_key)
+            return 1
+        print("   ✓ 按住 %s 说话，松开发送（不用找按钮）" % cfg.voice_key)
+        print("\n链路通了。把 config.json 的 voice_enabled 改成 true 就会发语音。")
+        return 0
+
+    try:
+        bot = Bot(cfg, db=None, dry_run=True)
+        wx = bot._ensure_wx()
+        uia = wx._gui._get_uia()
+        pos = bot._voice_button_pos(uia) if uia is not None else None
+    except Exception as exc:
+        print("   ✗ 拿不到微信窗口：%s（先把微信登录好再跑）" % exc)
+        return 1
+    if pos is None:
+        print("   ✗ 认不出来。跑 .\\run.cmd --probe-voice 看控件列表；"
+              "也可以先手工试：把鼠标放进输入框按住不动，"
+              "会弹「松开发送 / 取消发送」的话，把 voice_button 填成 \"box\" 就行")
+        return 1
+    print("   ✓ (%d, %d)" % pos)
+    print("\n链路通了。把 config.json 的 voice_enabled 改成 true 就会发语音。")
+    return 0
+
+
+def breeze_voices(cfg: Config) -> int:
+    """--voice-breeze-voices：列出 BreezeBlue 里的中文女声（挑 voice_breeze_voice 用）。"""
+    try:
+        from breeze_blue import BreezeBlue
+    except Exception as exc:
+        print("没装 SDK：pip install breeze-blue（%r）" % (exc,))
+        return 1
+    key = (cfg.voice_breeze_key or os.environ.get("BREEZE_API_KEY", "")).strip()
+    if not key:
+        print('先配 key：config.json 的 "voice_breeze_key"，或 setx BREEZE_API_KEY "brz_..."')
+        return 1
+    try:
+        client = BreezeBlue(api_key=key, timeout=30.0)
+        res = client.voices.search(language_code="zh", gender=["female"])
+        voices = (res or {}).get("voices") or []
+    except Exception as exc:
+        print("查音色失败：%r" % (exc,))
+        return 1
+
+    print("中文女声 %d 个：" % len(voices))
+    for v in voices[:30]:
+        print("  %-30s %s" % (v.get("voice_id"), v.get("name")))
+    if voices:
+        print('\n挑一个填进 config.json： "voice_breeze_voice": "%s"' % voices[0].get("voice_id"))
+        print("填完跑： .\\run.cmd --voice-play  试听")
+    return 0
+
+
+def voice_play(cfg: Config, text: str = "") -> int:
+    """--voice-play：合成一句直接播到扬声器，专门用来调音色（不发消息、不走 CABLE）。"""
+    text = (text or "嗯？你怎么突然想起我啦，我在的呢，刚刚还想跟你说说话。").strip()
+    out_dir = os.path.join(os.getcwd(), "_voice")
+    t0 = time.time()
+    try:
+        wav, used = voice_lib.speak(
+            text, out_dir, cfg.voice_engine,
+            rate=cfg.voice_rate, pitch=cfg.voice_pitch, voice_name=cfg.voice_name,
+            breeze_key=cfg.voice_breeze_key, breeze_voice=cfg.voice_breeze_voice)
+    except voice_lib.VoiceError as exc:
+        print("✗ 合成失败：%s" % exc)
+        return 1
+    print("引擎 %s｜语速 %+d%%｜音高 %+d%%｜音色 %s"
+          % (used, cfg.voice_rate, cfg.voice_pitch, cfg.voice_name or "自动"))
+    print("文件：%s（%.0f KB，合成用了 %.1fs）"
+          % (wav, os.path.getsize(wav) / 1024, time.time() - t0))
+    try:
+        dur = voice_lib.play_wav(wav, None)     # None = 系统默认设备（扬声器）
+    except voice_lib.VoiceError as exc:
+        print("✗ 播放失败：%s" % exc)
+        return 1
+    print("✓ 播完 %.2fs（这次走扬声器，没经过 CABLE）" % dur)
+    print("想调：改 config.json 的 voice_rate / voice_pitch（百分比，正数=更快更亮）")
+    return 0
+
+
+def voice_try(cfg: Config, text: str = "", target: str = "文件传输助手") -> int:
+    """--voice-try：真发一条语音到「文件传输助手」，端到端验一遍（不打扰别人）。"""
+    text = (text or "你好呀，我是小鲸鱼，这是一条测试语音。").strip()
+    print("准备发一条测试语音到「%s」：%s" % (target, text))
+    if cfg.voice_key:
+        print("方式：按住 %s 说话 → 播到 %s → 松开发送" % (cfg.voice_key, cfg.voice_device))
+    try:
+        bot = Bot(cfg, db=None, dry_run=True)
+        wx = bot._ensure_wx()
+        resp = bot._send_voice(wx, text, target)
+    except Exception as exc:
+        print("✗ 发送异常：%r" % (exc,))
+        return 1
+
+    ok = getattr(resp, "is_success", True)
+    print(("✓ " if ok else "✗ ") + str(resp))
+
+    # 再拿数据库核一遍：真落了一条「语音」才算通（界面看不出来的假成功太多了）
+    try:
+        db, _info = open_wechat_db(cfg)
+        rows = db.get_messages("filehelper", limit=3) or []
+        types = [str(r.get("type")) for r in rows]
+        print("文件传输助手最新消息类型：%s" % ("、".join(types) or "（空）"))
+        if types[:1] == ["语音"]:
+            print("✓ 数据库确认：最新一条就是语音消息")
+            ok = True
+    except Exception as exc:
+        print("（核对数据库失败：%r）" % (exc,))
+
+    if ok:
+        print("\n去微信「文件传输助手」里点开听一下；没问题就把 voice_enabled 改成 true。")
+    else:
+        print("\n没成。先手工确认一次：微信窗口在前台时，你自己按住右 Alt 1 秒再松开，"
+              "会不会出「松开发送」的录音条？把这句的答案告诉我。")
+    return 0 if ok else 1
+
+
+def probe_voice(cfg: Config) -> int:
+    """--probe-voice：把输入框周围那排控件列出来（排 voice_button 用）。
+
+    微信的工具栏不一定会给控件起名字，所以除了「名字带语音」的，还会把输入框
+    下方那一整条（工具栏所在的高度带）里**所有有名字的控件**都打出来。
+    """
+    try:
+        bot = Bot(cfg, db=None, dry_run=True)
+        wx = bot._ensure_wx()
+        uia = wx._gui._get_uia()
+        win = None
+        if uia is not None:
+            try:
+                uia.ensure_window()
+            except Exception:
+                pass
+            win = getattr(uia, "_win", None)
+    except Exception as exc:
+        print("拿不到微信窗口：%s（先把微信登录好再跑）" % exc)
+        return 1
+    if win is None:
+        print("UIA 不可用（窗口没起来或者锁屏了）")
+        return 1
+
+    box = None
+    try:
+        box = uia._chat_input()
+    except Exception:
+        pass
+    br = None
+    if box is not None:
+        r = box.BoundingRectangle
+        br = (r.left, r.top, r.right, r.bottom)
+        print("输入框：(%d,%d)-(%d,%d)  Name=%r" % (br[0], br[1], br[2], br[3], box.Name))
+    else:
+        print("输入框：没找到（窗口没打开会话？）")
+
+    named, voiceish, stack = [], [], [(win, 0)]
+    while stack:
+        ctrl, depth = stack.pop()
+        if depth < 10:
+            try:
+                for child in ctrl.GetChildren():
+                    stack.append((child, depth + 1))
+            except Exception:
+                pass
+        try:
+            name = (ctrl.Name or "").strip()
+            rect = ctrl.BoundingRectangle
+            ctype = ctrl.ControlTypeName
+        except Exception:
+            continue
+        if not name or rect.width() <= 0 or rect.height() <= 0:
+            continue
+        row = (ctype, name, (rect.left, rect.top, rect.right, rect.bottom), depth)
+        if any(k in name for k in ("语音", "说话", "麦克风", "录音", "按住", "长按")):
+            voiceish.append(row)
+        if br and br[3] - 40 <= rect.top <= br[3] + 200:
+            named.append(row)
+
+    print("\n== 名字像语音的控件（%d 个）==" % len(voiceish))
+    for ctype, name, r, depth in sorted(voiceish, key=lambda h: (h[2][1], h[2][0])):
+        print("  %-16s (%4d,%4d)-(%4d,%4d) d=%d %r"
+              % (ctype, r[0], r[1], r[2], r[3], depth, name))
+
+    print("\n== 输入框下面那一条里的控件（%d 个）==" % len(named))
+    for ctype, name, r, depth in sorted(named, key=lambda h: (h[2][1], h[2][0]))[:40]:
+        print("  %-16s (%4d,%4d)-(%4d,%4d) d=%d %r"
+              % (ctype, r[0], r[1], r[2], r[3], depth, name))
+
+    print("\n填法（config.json）：")
+    print('  "voice_button": "box"          # 直接按住输入框（微信提示「长按鼠标 语音输入」）')
+    print('  "voice_button": "win:623,975"  # 窗口左上角起算的坐标')
+    print('  "voice_button": "1192,1110"    # 屏幕绝对坐标')
+    return 0
+
+
 # ────────────────────────────── 机器人 ──────────────────────────────
 
 
@@ -685,6 +1141,10 @@ class Bot:
         self._last_msg_at = 0.0
         base = os.path.dirname(os.path.abspath(cfg.memory_file)) if cfg.memory_file else os.getcwd()
         self._img_dir = os.path.join(base, "_images")
+        self._voice_dir = os.path.join(base, "_voice")   # 合成出来的 wav 临时放这儿
+        self._voice_fails = 0        # 连续失败次数
+        self._voice_off = False      # 连挂几次就本次运行不再试（免得每条都卡几秒）
+        self._image_key = ""         # 图片 AES 密钥（启动时从磁盘/内存拿到）
 
     # -- 发送 --------------------------------------------------------------
 
@@ -700,6 +1160,12 @@ class Bot:
                 hwnd = pick_send_window(self.cfg, self.db) if self.db is not None else 0
                 gui = WeChatGUI(hwnd=hwnd) if hwnd else WeChatGUI()
                 self._wx_hwnd = gui.main_hwnd
+                # 微信收在托盘/最小化时 UIA 树是空的，先把窗口拉回来再钉 UIA
+                if restore_window(gui.main_hwnd, gui):
+                    try:
+                        gui._update_render_rect()
+                    except Exception:
+                        pass
                 # 复用同一个 WeChatDB 实例，省掉一次数据库解密
                 wx = WeChat(gui=gui, db=self.db) if self.db is not None else WeChat(gui=gui)
                 # 坐标和 UIA 必须是同一个窗口，否则多开时会「看着这个、发到那个」
@@ -782,33 +1248,56 @@ class Bot:
 
         who = self.resolve_name(chat_id)
 
+        # 语音开关：这条要不要「说」出来。命中就发语音条、不再发文字；
+        # 任何一步失败都会掉回下面的文字分支，不会把回复吞掉。
+        speak_line = self._pick_voice_line(text)
+
         if self.dry_run:
-            for c in chunks:
-                log.info("[dry-run] → %s: %s", who, c)
+            if speak_line:
+                log.info("[dry-run] → %s: [语音] %s", who, speak_line)
+            else:
+                for c in chunks:
+                    log.info("[dry-run] → %s: %s", who, c)
             for name in sticker_names[: self.cfg.sticker_max]:
                 path = resolve_sticker(self.cfg.sticker_dir, name)
                 log.info("[dry-run] → %s: [表情:%s] %s", who, name,
                          path or "（没找到这个文件）")
             return True
 
-        ok = True
-        for i, chunk in enumerate(chunks):
-            if i:
-                time.sleep(1.2)   # 连续发送太快会被微信吞掉
-            resp, err = self._submit("text", chunk, who)
-            self.echo.remember(chat_id, chunk)
+        voice_sent = False
+        if speak_line:
+            resp, err = self._submit("voice", speak_line, who)
             if err is not None:
-                ok = False
-                log.error("发送异常 %s：%r", who, err)
-                self._name_cache.pop(chat_id, None)
+                log.error("语音发送异常 %s：%r（改发文字）", who, err)
+                self._note_voice_fail()
             elif getattr(resp, "is_success", None) is False:
-                ok = False
-                log.error("发送失败 %s: %s", who, resp)
-                # 可能是群改名了，清掉缓存下次重新解析
-                self._name_cache.pop(chat_id, None)
+                log.warning("语音没发出去 %s：%s（改发文字）", who, resp)
+                self._note_voice_fail()
             else:
-                log.info("已回复 %s（%d/%d）：%s", who, i + 1, len(chunks),
-                         chunk[:40].replace("\n", " "))
+                voice_sent = True
+                self._voice_fails = 0
+                self.echo.remember(chat_id, speak_line)
+                log.info("已发语音 %s：%s", who, speak_line[:40])
+
+        ok = True
+        if not voice_sent:
+            for i, chunk in enumerate(chunks):
+                if i:
+                    time.sleep(1.2)   # 连续发送太快会被微信吞掉
+                resp, err = self._submit("text", chunk, who)
+                self.echo.remember(chat_id, chunk)
+                if err is not None:
+                    ok = False
+                    log.error("发送异常 %s：%r", who, err)
+                    self._name_cache.pop(chat_id, None)
+                elif getattr(resp, "is_success", None) is False:
+                    ok = False
+                    log.error("发送失败 %s: %s", who, resp)
+                    # 可能是群改名了，清掉缓存下次重新解析
+                    self._name_cache.pop(chat_id, None)
+                else:
+                    log.info("已回复 %s（%d/%d）：%s", who, i + 1, len(chunks),
+                             chunk[:40].replace("\n", " "))
 
         # 文字发完再补表情，模拟真人「先说一句，再甩张图」
         for name in sticker_names[: max(0, self.cfg.sticker_max)]:
@@ -832,7 +1321,7 @@ class Bot:
     def _submit(self, kind: str, payload: str, who: str):
         """把一次发送交给发送线程，并同步等结果。
 
-        kind: "text" 发文字 / "image" 发本地图片（表情包）
+        kind: "text" 发文字 / "image" 发本地图片（表情包）/ "voice" 发语音条
         """
         box: dict = {"resp": None, "error": None, "event": threading.Event()}
         self._start_sender()
@@ -870,8 +1359,19 @@ class Bot:
             for attempt in (1, 2):
                 try:
                     wx = self._ensure_wx()
+                    # 每条发送前都看一眼：窗口可能在两次发送之间被最小化了，
+                    # 而库里的 ensure_visible() 有 15 秒缓存，不会替我们还原
+                    if restore_window(self._wx_hwnd or getattr(
+                            getattr(wx, "_gui", None), "main_hwnd", 0),
+                            getattr(wx, "_gui", None)):
+                        try:
+                            wx._gui._update_render_rect()
+                        except Exception:
+                            pass
                     if kind == "image":
                         box["resp"] = self._send_image(wx, payload, who)
+                    elif kind == "voice":
+                        box["resp"] = self._send_voice(wx, payload, who)
                     else:
                         box["resp"] = wx.SendMsg(payload, who=who)
                     box["error"] = None
@@ -923,6 +1423,219 @@ class Bot:
             log.warning("UIA 发图失败（%r），退回默认路径", exc)
 
         return wx.SendFiles(path, who=who)
+
+    # -- 发语音 ------------------------------------------------------------
+
+    # 语音键的名字。微信 4.x 的叫法可能是「按住说话」「语音消息」「语音」；
+    # 带「输入/文字」的是语音转文字那颗，按下去会往输入框里写字，必须排除。
+    _VOICE_BTN_WORDS = ("按住说话", "语音消息", "语音")
+    _VOICE_BTN_SKIP = ("输入", "文字", "通话")
+
+    def _pick_voice_line(self, text: str) -> str:
+        """这条回复要不要发语音；要的话返回要念的那句话，否则返回空串。"""
+        if self._voice_off or not should_voice(text, self.cfg):
+            return ""
+        return speakable(text, self.cfg.voice_max_chars)
+
+    def _note_voice_fail(self) -> None:
+        self._voice_fails += 1
+        if self._voice_fails >= 3 and not self._voice_off:
+            self._voice_off = True
+            log.error("语音连着失败 %d 次，本次运行改成只发文字；先跑 "
+                      "python wx_bot.py --voice-test 看是哪一步不通", self._voice_fails)
+
+    def _win_rect(self, uia):
+        try:
+            r = uia._win.BoundingRectangle
+            return (r.left, r.top, r.right, r.bottom)
+        except Exception:
+            return None
+
+    def _box_hold_pos(self, uia):
+        """按住输入框本身（微信提示「长按鼠标 语音输入」，录音就是从框里起的）。"""
+        try:
+            r = uia._chat_input().BoundingRectangle
+        except Exception:
+            return None
+        # 靠上一点，避开底下那排工具栏图标
+        return (r.left + r.right) // 2, r.top + max(12, min(40, (r.bottom - r.top) // 4))
+
+    def _voice_button_pos(self, uia):
+        """语音键的屏幕坐标；``voice_button`` 填了就直接用。"""
+        raw = (self.cfg.voice_button or "").strip()
+        if raw:
+            low = raw.lower()
+            if low in ("box", "input", "输入框"):
+                return self._box_hold_pos(uia)
+            try:
+                if low.startswith("win:"):
+                    win_rect = self._win_rect(uia)
+                    if win_rect is None:
+                        log.warning("voice_button 用了 win: 但拿不到窗口矩形")
+                        return None
+                    x, y = [int(v) for v in re.split(r"[,，\s]+", raw[4:].strip())[:2]]
+                    return win_rect[0] + x, win_rect[1] + y
+                x, y = [int(v) for v in re.split(r"[,，\s]+", raw)[:2]]
+                return x, y
+            except Exception:
+                log.warning("voice_button 要写成 \"box\" / \"win:x,y\" / \"x,y\"，"
+                            "现在读到 %r", raw)
+
+        win = getattr(uia, "_win", None)
+        if win is None:
+            try:
+                uia.ensure_window()
+            except Exception:
+                pass
+            win = getattr(uia, "_win", None)
+        if win is None:
+            return None
+        box_rect = None
+        try:
+            box = uia._chat_input()
+            if box is not None:
+                r = box.BoundingRectangle
+                box_rect = (r.left, r.top, r.right, r.bottom)
+        except Exception:
+            box_rect = None
+
+        best = None          # (分数, x, y, 名字)
+        stack = [(win, 0)]
+        while stack:
+            ctrl, depth = stack.pop()
+            if depth < 10:
+                try:
+                    for child in ctrl.GetChildren():
+                        stack.append((child, depth + 1))
+                except Exception:
+                    pass
+            try:
+                name = (ctrl.Name or "").strip()
+                rect = ctrl.BoundingRectangle
+            except Exception:
+                continue
+            if not name or rect.width() <= 0 or rect.height() <= 0:
+                continue
+            if any(bad in name for bad in self._VOICE_BTN_SKIP):
+                continue
+            if not any(word in name for word in self._VOICE_BTN_WORDS):
+                continue
+            score = 1
+            # 工具栏在输入框那一行附近；命中这块区域的优先
+            if box_rect and box_rect[1] <= rect.top <= box_rect[3] + 160:
+                score = 2
+            if best is None or score > best[0]:
+                best = (score, (rect.left + rect.right) // 2,
+                        (rect.top + rect.bottom) // 2, name)
+        if best is None:
+            return None
+        log.info("语音按钮：%r → (%d,%d)", best[3], best[1], best[2])
+        return best[1], best[2]
+
+    def _send_voice(self, wx, text: str, who: str):
+        """合成一句话，按住微信的语音键把它「说」进麦克风。
+
+        微信电脑版的语音条只从麦克风录，所以链路是:
+            文字 --合成--> wav --waveOut--> CABLE Input
+                                             └→ 微信从 CABLE Output 当麦克风收
+        按住期间光标停在语音键上，松开才发送（中途移动鼠标会被微信当成取消）。
+        """
+        from wechatauto import WxResponse
+
+        device = voice_lib.find_output(self.cfg.voice_device)
+        if device is None:
+            names = "、".join(n for _, n in voice_lib.list_outputs()) or "（一台都没找到）"
+            return WxResponse.failure(
+                "找不到声卡「%s」（装了 VB-Cable 才有）；现有：%s"
+                % (self.cfg.voice_device, names))
+
+        try:
+            wav, used = voice_lib.speak(
+                text, self._voice_dir, self.cfg.voice_engine,
+                rate=self.cfg.voice_rate, pitch=self.cfg.voice_pitch,
+                voice_name=self.cfg.voice_name,
+                breeze_key=self.cfg.voice_breeze_key,
+                breeze_voice=self.cfg.voice_breeze_voice)
+        except voice_lib.VoiceError as exc:
+            return WxResponse.failure("合成语音失败：%s" % exc)
+
+        uia = None
+        try:
+            uia = wx._gui._get_uia()
+        except Exception:
+            uia = None
+        if uia is None:
+            return WxResponse.failure("UIA 不可用，发不了语音")
+
+        try:
+            already = (not who) or uia.current_chat() == who
+        except Exception:
+            already = False
+        if not (already or uia.open_chat(who)):
+            return WxResponse.failure("打不开会话：%s" % who)
+
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        key = voice_lib.vk_for(self.cfg.voice_key) if self.cfg.voice_key else None
+        dur = 0.0
+        if key is not None:
+            # 快捷键是发给「当前前台窗口」的，微信不在前台时 Alt 会被别的程序吃掉
+            try:
+                if user32.GetForegroundWindow() != self._wx_hwnd:
+                    wx._gui.bring_to_front(keep_topmost=False)
+            except Exception:
+                pass
+            # 快捷键模式：按住右 Alt = 说话，松开 = 发送。不碰鼠标，不用找按钮。
+            try:
+                uia._chat_input().SetFocus()
+            except Exception:
+                pass
+            time.sleep(0.15)
+            voice_lib.key_down(key)
+            try:
+                time.sleep(0.5)                 # 等微信切进录音状态
+                dur = voice_lib.play_wav(wav, device)
+                time.sleep(0.35)                # 尾巴：把最后一个字录进去
+            except voice_lib.VoiceError as exc:
+                return WxResponse.failure("播放失败：%s" % exc)
+            finally:
+                voice_lib.key_up(key)           # 松开 = 发送
+            how = self.cfg.voice_key
+        else:
+            pos = self._voice_button_pos(uia)
+            if pos is None:
+                return WxResponse.failure(
+                    "既没配快捷键也认不出语音键：把 config.json 的 voice_key 设成 "
+                    "alt_r，或者跑 python wx_bot.py --probe-voice 看控件再填 voice_button")
+            x, y = pos
+            uia._set_cursor(x, y)
+            time.sleep(0.15)
+            saved = uia._clear_transparent(x, y)   # 微信画在分层透明窗口上，不摘掉点不中
+            down = False
+            try:
+                user32.mouse_event(0x0002, 0, 0, 0, 0)      # 左键按下 = 开始录
+                down = True
+                time.sleep(0.45)                            # 等微信切进录音状态
+                dur = voice_lib.play_wav(wav, device)
+                time.sleep(0.35)                            # 尾巴：把最后一个字录进去
+                user32.mouse_event(0x0004, 0, 0, 0, 0)      # 松开 = 发送
+                down = False
+            except voice_lib.VoiceError as exc:
+                return WxResponse.failure("播放失败：%s" % exc)
+            finally:
+                if down:
+                    user32.mouse_event(0x0004, 0, 0, 0, 0)
+                uia._restore_transparent(saved)
+            how = "鼠标(%d,%d)" % (x, y)
+
+        log.info("语音已发 %s（%.1fs，引擎 %s，方式 %s，声卡 %s）", who, dur, used,
+                 how, voice_lib.hw_output_name(device))
+        try:
+            os.remove(wav)          # 发成功了就不用留；失败时留着好查
+        except OSError:
+            pass
+        return WxResponse.success("语音已发送（%.1fs）" % dur, data={"path": wav})
 
     def _apologize(self, chat_id: str) -> None:
         """出错时最多 10 分钟安慰一次，避免 API 挂了就刷屏。"""
@@ -1078,9 +1791,23 @@ class Bot:
 
                 if self._media is None:
                     os.makedirs(self._img_dir, exist_ok=True)
-                    self._media = MediaDownloader(self.db, save_dir=self._img_dir)
+                    # 把密钥显式喂进去：进程每启动一次，cfg_dword 提取都可能失败，
+                    # 存盘的那份能省掉一次「等你点开大图」的等待
+                    self._media = MediaDownloader(
+                        self.db, save_dir=self._img_dir,
+                        image_key=self._image_key or None)
                 box["path"] = self._media.download_image(
                     chat_id, rec.get("local_id"), tier="best", shard=rec.get("shard"))
+                if box["path"] and not self._image_key:
+                    # 慢路径（等你在微信里点开大图）终于抓到密钥了：存下来，下次直接用
+                    try:
+                        lib_key = self._media._load_persisted_key()
+                    except Exception:
+                        lib_key = None
+                    if lib_key:
+                        save_image_key(self._img_dir, lib_key)
+                        self._image_key = lib_key
+                        log.info("图片密钥已抓到并存盘，下次启动不用再等")
             except Exception as exc:
                 box["error"] = exc
             finally:
@@ -1201,6 +1928,21 @@ class Bot:
         return prune_images(self._img_dir,
                             keep_days=self.cfg.image_keep_days,
                             keep_max=self.cfg.image_keep_max)
+
+    def cleanup_voice(self) -> int:
+        """清掉 _voice/ 里发送失败留下的 wav，返回删掉的个数。"""
+        return prune_voice(self._voice_dir)
+
+    def setup_image_key(self) -> bool:
+        """启动时准备好图片密钥（磁盘缓存优先，其次 cfg_dword 派生），返回是否可用。"""
+        if self.db is None:
+            return False
+        try:
+            self._image_key = ensure_image_key(self.db, self._img_dir)
+        except Exception as exc:
+            log.warning("准备图片密钥失败：%r", exc)
+            self._image_key = ""
+        return bool(self._image_key)
 
     def _run_tool(self, person: str, name: str, args_json: str) -> str:
         """模型点名的工具在这里执行。目前只有联网搜索。"""
@@ -1653,6 +2395,16 @@ def main() -> int:
     parser.add_argument("--chat", action="append", default=[], help="只监听指定会话（可多次）")
     parser.add_argument("--wx-list", action="store_true",
                         help="列出微信账号目录和窗口（多开时用来锁定）")
+    parser.add_argument("--voice-test", action="store_true",
+                        help="语音链路体检：声卡 → 合成 → 播放 → 录语音的方式")
+    parser.add_argument("--voice-try", action="store_true",
+                        help="真发一条测试语音到「文件传输助手」（端到端，安全）")
+    parser.add_argument("--voice-play", action="store_true",
+                        help="合成一句播到扬声器（调音色用，不发消息）")
+    parser.add_argument("--voice-breeze-voices", action="store_true",
+                        help="列出 BreezeBlue 的中文女声（挑音色 id 用）")
+    parser.add_argument("--probe-voice", action="store_true",
+                        help="列出微信窗口里带「语音」的控件（填 voice_button 用）")
     args = parser.parse_args()
 
     if not os.path.exists(args.config):
@@ -1667,6 +2419,17 @@ def main() -> int:
         return wx_list(cfg)
 
     apply_rhythm(cfg)          # 拟人节流：默认关，否则每次动作要等 2.5~6 秒
+
+    if args.voice_test:
+        return voice_test(cfg)
+    if args.voice_play:
+        return voice_play(cfg)
+    if args.voice_breeze_voices:
+        return breeze_voices(cfg)
+    if args.voice_try:
+        return voice_try(cfg)
+    if args.probe_voice:
+        return probe_voice(cfg)
 
     # --check 即使没配 key 也要跑，好让人看到微信那两项的状态
     if not cfg.api_key and not args.check:
@@ -1751,11 +2514,12 @@ def main() -> int:
     if cfg.vision_enabled:
         log.info("识图：%s（detail=%s，%d 张/小时/人）",
                  cfg.vision_model, cfg.vision_detail, cfg.vision_max_per_hour)
-        keyfile = os.path.join(getattr(db, "workdir", "") or "", "image_keys.json")
-        if keyfile and os.path.exists(keyfile):
-            log.info("图片解密码：已缓存 ✅")
+        # 图片密钥：先看存过的那份，没有再赌一次内存派生；拿到就落盘
+        if bot.setup_image_key():
+            log.info("图片密钥：可用 ✅")
         else:
-            log.info("图片解密码：还没抓到 —— 在微信里点开任意一张大图看几秒，程序会自己抓")
+            log.info("图片密钥：没拿到 —— 识图会先等你在微信里点开一张大图"
+                     "（最多 %d 秒），抓不到就只回文字", int(IMAGE_FETCH_WAIT))
     else:
         log.info("识图：已关闭")
 
@@ -1776,6 +2540,10 @@ def main() -> int:
     if dropped:
         log.info("清理识图临时图片 %d 张（保留 %d 天 / 最多 %d 张）",
                  dropped, cfg.image_keep_days, cfg.image_keep_max)
+    # 发语音失败时留下的 wav 同理，启动清一遍
+    stale = bot.cleanup_voice()
+    if stale:
+        log.info("清理语音临时文件 %d 个", stale)
 
     t_listen = time.time()
     listener = Listener(db, interval=1.0)
@@ -1808,6 +2576,9 @@ def main() -> int:
                 dropped = bot.cleanup_images()
                 if dropped:
                     log.info("清理识图临时图片 %d 张", dropped)
+                stale = bot.cleanup_voice()
+                if stale:
+                    log.info("清理语音临时文件 %d 个", stale)
             if time.time() >= next_watch:
                 next_watch = time.time() + 15
                 bot.watchdog()

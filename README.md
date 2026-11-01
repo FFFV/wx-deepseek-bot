@@ -34,6 +34,7 @@
 | 人设 | 用 `persona.txt` 定义说话风格，可换成任何角色 | 开 |
 | 分条发送 | 多行回复拆成几条发出去，像真人连打几条 | 开 |
 | 表情包 | 模型按需发本地图片，一条最多一张 | 开 |
+| 语音 | 把回复念出来发成语音条（要装虚拟声卡） | 关 |
 | 颜文字 | 按情绪贴颜文字，有概率和冷却 | 开 |
 | 识图 | 能看对方发来的图片 | 开 |
 | 联网搜索 | 需要时查最新信息 | 开 |
@@ -164,6 +165,25 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 | `kaomoji_rate` | `0.5` | 模型标了情绪后，真正贴出来的概率 |
 | `kaomoji_cooldown` | `300` | 同一个会话多少秒内最多贴一次 |
 
+### 发语音
+
+默认关。开着的时候，满足条件的回复会**合成成语音条**发出去、不再发文字；任何一步失败都自动退回打字，不会把回复吞掉。前两步是一次性准备，见 [6.4](#64-发语音语音条)。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `voice_enabled` | `false` | 总开关。关着绝不说 |
+| `voice_ratio` | `1.0` | 满足条件的回复里，多大比例真的念出来（1 = 都念） |
+| `voice_max_chars` | `60` | 念出来的字数上限。更长的回复仍打字 |
+| `voice_engine` | `auto` | 合成引擎。`auto` 依次试 `breeze` → `edge` → `winrt` → `powershell` → `sapi` |
+| `voice_rate` | `0` | 语速（百分比，正数更快）。`0` = 原速；调太快会有"加速过"的感觉 |
+| `voice_pitch` | `0` | 音高（百分比，正数更亮）。只有 `edge` / 系统引擎认，Breeze 的音高由音色本身决定 |
+| `voice_name` | `""` | 音色名的一段。留空=自动挑中文女声；装了 edge-tts 后可填 `zh-CN-XiaoyiNeural`（元气少女）/ `zh-CN-XiaoxiaoNeural`（温柔） |
+| `voice_breeze_key` | `""` | BreezeBlue 的 API key（`brz_...`）。留空则读环境变量 `BREEZE_API_KEY` |
+| `voice_breeze_voice` | `""` | BreezeBlue 的音色 id（`voc_...`），用 `run.cmd --voice-breeze-voices` 列出来挑 |
+| `voice_device` | `CABLE Input` | 播到哪台声卡。装了 VB-Cable 才有这台 |
+| `voice_key` | `alt_r` | 按住说话的快捷键（右 Alt），松开发送。不抢鼠标，推荐这个 |
+| `voice_button` | `""` | `voice_key` 留空时才用：`box`=按住输入框 / `win:623,975`=窗口内坐标 / `1192,1110`=屏幕坐标 |
+
 ### 识图
 
 | 字段 | 默认 | 说明 |
@@ -270,6 +290,11 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 | 只监听指定会话 | `run.cmd --chat wxid_xxx`（群是 `12345678901@chatroom`，可写多次） |
 | 用别的配置文件 | `run.cmd --config other.json` |
 | 查微信账号 / 窗口 | `run.cmd --wx-list`（多开微信、要锁定账号时用） |
+| 语音链路体检 | `run.cmd --voice-test`（声卡 → 合成 → 播放 → 录语音方式） |
+| 试听音色 | `run.cmd --voice-play`（合成一句直接放出来，不发消息） |
+| 列 Breeze 音色 | `run.cmd --voice-breeze-voices`（挑一个 `voc_...` 填进 `voice_breeze_voice`） |
+| 真发一条语音 | `run.cmd --voice-try`（发到文件传输助手，安全） |
+| 看语音键的控件 | `run.cmd --probe-voice`（自动认不出来时，拿坐标填 `voice_button`） |
 | 停止 | 在窗口里按 `Ctrl+C` |
 
 启动成功的日志长这样：
@@ -344,7 +369,77 @@ stickers/晚安.gif
 
 一条回复最多一张（`sticker_max`）。**表情版权自己负责**，别用有商用限制的素材。
 
-### 6.4 识图
+### 6.4 发语音（语音条）
+
+微信电脑版 4.1.15 起支持「按住说话」发语音条。语音条只从**麦克风**录，所以程序走的是「虚拟声卡当麦克风」这条路：
+
+```
+回复文字 ──合成──▶ wav ──waveOut──▶ CABLE Input（播放端）
+                                        │
+按住右 Alt ◀── 声音从 CABLE Output（录音端）进来，微信当它是麦克风
+```
+
+**录音用快捷键**：按住**右 Alt** 开始说、松开发送——这是微信自带的快捷键，所以不用去点工具栏那个麦克风，不抢鼠标也不会点错。想换键就改 `voice_key`（`alt_l` / `ctrl_r` / `shift_r` 等），留空则退回「鼠标按住某个位置」的模式。
+
+**一次性准备**（做完就不用再碰）：
+
+1. 装 [VB-Cable](https://vb-audio.com/Cable/)（免费虚拟声卡驱动），装完重启微信。
+2. 让微信用 `CABLE Output` 当麦克风：微信 设置 → 语音与视频 里选；没有这一项就改 Windows 的默认录音设备。
+
+然后跑一次体检：
+
+```bat
+run.cmd --voice-test
+```
+
+```
+① 声卡    ✓ 播到 CABLE Input (VB-Audio Virtual Cable)
+② 合成    ✓ 引擎 powershell：...\_voice\v_210537.wav（209 KB）
+③ 播放    ✓ 4.9s
+④ 方式    ✓ 按住 alt_r 说话，松开发送
+```
+
+四步都 ✓ 就通了；哪一步 ✗ 会在下面直接告诉你缺什么。通了以后把 `config.json` 的 `voice_enabled` 改成 `true`。
+
+**音色**：`auto` 的顺序是「好听 → 能出声」，装了哪个在线引擎就自动用哪个。什么都没装时用系统自带的 Huihui（成年女声，机器味重），只能靠 `voice_rate` / `voice_pitch` 调快调亮。
+
+想要真自然的，装一个在线引擎，二选一（两者都要 `pip install imageio-ffmpeg`，把在线引擎返回的 mp3 转成 wav）：
+
+* **BreezeBlue**（`auto` 里排第一，最像真人，按字扣费）—— 需要 Python 3.10+：
+
+  ```bat
+  pip install breeze-blue
+  ```
+
+  到 [BreezeBlue 开发者控制台](https://docs.breezeblue.ai) 建一个 API key（`brz_...`），填进 `config.json` 的 `voice_breeze_key`（或者设环境变量 `BREEZE_API_KEY`）；音色 id 用下面的命令列出来挑一个，填进 `voice_breeze_voice`：
+
+  ```bat
+  run.cmd --voice-breeze-voices
+  ```
+
+* **edge-tts**（免费、不用 key，微软 Edge 的朗读音色）：
+
+  ```bat
+  pip install edge-tts
+  ```
+
+  `voice_name` 填 `zh-CN-XiaoyiNeural`（元气少女）/ `zh-CN-XiaoxiaoNeural`（温柔，默认）/ `zh-CN-YunxiNeural`（男声）。
+
+调音色时用：
+
+```bat
+run.cmd --voice-play
+```
+
+合成一句直接放出来听，不发消息、不经过虚拟声卡，改一次配置听一次，几秒钟一轮。
+
+**什么时候会发语音**：开关开着 + 这句话念出来不超过 `voice_max_chars` + 骰子命中 `voice_ratio`。任一条不满足就正常打字。合成失败、声卡找不到、按住失败，都会自动退回发文字。
+
+**说话前会先"化妆"**：颜文字、表情、括号、多余标点都会删掉——不然 TTS 会把 `(*^▽^*)` 念成"左括号星号脱字符……"。
+
+**注意**：按住的那几秒会占用鼠标和微信窗口焦点（松开才发送，中途移动鼠标会被微信当成"取消"）。它发语音的时候你等它一下，别抢鼠标。
+
+### 6.5 识图
 
 对方发图后**紧接着的那条消息**（默认 60 秒内）会被一起看。
 
@@ -354,11 +449,11 @@ stickers/晚安.gif
 
 如果图片是 `.wxgf`（微信 4.x 的私有容器），还需要 ffmpeg —— `pip install imageio-ffmpeg`，或者自己装 ffmpeg 到 PATH。
 
-### 6.5 联网搜索
+### 6.6 联网搜索
 
 模型判断需要最新信息时才会搜索，普通闲聊不搜。每人每小时最多 6 次，一次对话最多连续搜两轮。
 
-### 6.6 记忆
+### 6.7 记忆
 
 记忆分四层，全自动，不需要手动管理：
 
@@ -375,7 +470,7 @@ stickers/晚安.gif
 
 想让她忘掉某个人：**先停掉程序**，编辑 `memory.json`，删掉 `profiles` 里对应那条，再启动。
 
-### 6.7 好感度
+### 6.8 好感度
 
 每个人有一个 0~100 的分，初次见面 **50**，影响她说话有多亲近：
 
@@ -389,7 +484,7 @@ stickers/晚安.gif
 
 涨跌由模型标 `[好感:N]` 触发，闸门在程序侧：单次最多 ±10、每天最多 +30 / -40、总分 0~100。
 
-### 6.8 主动说话（实验功能）
+### 6.9 主动说话（实验功能）
 
 打开后，**没被 @ 她也会偶尔自己接一句**，但只在 `proactive_ids` 名单里生效。
 
@@ -408,7 +503,7 @@ stickers/晚安.gif
 
 触发点永远是别人的一条消息，不会定时凭空找人聊天。
 
-### 6.9 多开微信
+### 6.10 多开微信
 
 同时登着两个微信号时，先跑一次：
 
@@ -422,7 +517,7 @@ run.cmd --wx-list
 
 **不用锁定也能跑**：只登一个微信号时，程序自动选，不需要配这两项。
 
-### 6.10 命令
+### 6.11 命令
 
 发下面这些词，会走程序自带逻辑（不经过模型）：
 
@@ -444,6 +539,7 @@ run.cmd --wx-list
 | `memory.json` | 记忆：对话、档案、摘要 | ❌ |
 | `stickers/` | 表情图（只提交说明和示例图） | 部分 |
 | `_images/` | 识图时下载的临时图片，自动清理 | ❌ |
+| `_voice/` | 发语音时合成的 wav 临时文件，发成功就删 | ❌ |
 | `wxbot.log` | 运行日志，自动轮转 | ❌ |
 
 ---
@@ -464,9 +560,16 @@ run.cmd --wx-list
 | 发图之后半天不回 | 取图卡在等密钥。程序最多等 20 秒就先回文字；在微信里点开一张大图把密钥喂上即可 |
 | `400 … unsupported image` | 图片是 `.wxgf` 容器，装 `imageio-ffmpeg` |
 | 回复偶尔要 20 多秒 | 建连时碰上了不响应的 CDN 节点，程序会在几秒内自动换一个地址；日志里会写原因 |
+| `--voice-test` ① 失败，找不到 `CABLE Input` | 没装 VB-Cable，或者装完没重启微信 |
+| `--voice-test` ② 失败 | 所有合成引擎都没成功（错误里带每个引擎的原因）。配了 `voice_breeze_key` 但没装 `breeze-blue`、没配音色 id，或者系统没有中文语音包（设置 → 时间和语言 → 语音 → 添加「中文(简体)」） |
+| `--voice-test` ④ 失败 | `voice_key` 填错了（只支持 `alt_r` / `alt_l` / `ctrl_r` / `ctrl_l` / `shift_r` / `shift_l`）；留空则退回鼠标模式，那时才需要 `voice_button` |
+| 按了快捷键没反应 | 微信窗口没在前台（程序会自己拉一次，但被别的窗口抢走就白按）；或者麦克风不是 `CABLE Output` |
+| 语音发出去了但没声音 | 微信的麦克风没选成 `CABLE Output`；或者 `voice_device` 指错了声卡 |
+| 语音里是环境杂音 | `voice_device` 指到了扬声器，微信直接录了房间的声音。改成 `CABLE Input` |
 | 群里一直不回 | 没 @ 你。要么 @ 一下，要么把 `group_mode` 改成 `all`（不建议） |
 | 刚启动不回消息 | 先看日志有没有「已锁定微信账号」。多开微信选错账号时会读另一个号的库（`run.cmd --wx-list` 查，填 `wx_account` 锁死）；启动卡在「正在打开微信数据库」说明在重算密钥，锁账号可避免 |
 | 回复发到了另一个微信号上 | 多开窗口选错。`run.cmd --wx-list` 查 hwnd，填进 `wx_hwnd` |
+| 微信最小化后不回消息 | 以前底层库的「窗口可见」检查有 15 秒缓存，最小化后不会把窗口拉起来，粘贴和回车全打在最小化窗口上，消息静默丢失。现在每条发送前都会先还原窗口，日志里会出现「已拉回来」；如果出现「还原没成功」，说明系统不让程序动这个窗口（权限/桌面），把那行日志发我 |
 | 发送要等很久 / 一直不回 | 日志里搜「已经等了 N 秒还没发出去」，能看出卡在模型还是卡在发送 |
 | 程序一闪就退 | 用 `run.cmd` 启动（窗口会停住）；直接双击 `python` 脚本看不清报错 |
 

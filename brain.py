@@ -165,6 +165,23 @@ class Config:
     sticker_dir: str = "stickers"   # 表情图片目录（相对 config.json）
     sticker_max: int = 1            # 一条回复最多带几个表情
 
+    # ---- 发语音（真语音条：合成 → 灌进虚拟声卡 → 按住微信的语音键放出来）----
+    # 默认关。开着也只是「可能」发语音，要过下面几个条件，失败会自动退回文字。
+    voice_enabled: bool = False
+    voice_ratio: float = 1.0        # 满足条件的回复里，多少比例真的走语音（1.0=都试）
+    voice_max_chars: int = 60       # 念出来的字数上限；更长的回复仍打字（语音条不像一口气说完）
+    voice_engine: str = "auto"      # auto = 依次试 breeze → edge → winrt → powershell → sapi
+    voice_rate: int = 0             # 语速（百分比，正数更快；0=原速）
+    voice_pitch: int = 0            # 音高（百分比，正数更亮；只对 edge/系统引擎生效）
+    voice_name: str = ""            # 想指定音色时填名字的一部分（如 "Kangkang"）；留空=自动挑中文女声
+    voice_breeze_key: str = ""      # BreezeBlue 的 API key（brz_...）；留空读环境变量 BREEZE_API_KEY
+    voice_breeze_voice: str = ""    # BreezeBlue 的音色 id（voc_...）
+    voice_device: str = "CABLE Input"  # 播到哪台声卡；装了 VB-Cable 才有这台
+    voice_key: str = "alt_r"        # 按住说话的快捷键（右 Alt）；留空=改用鼠标按住
+    # 语音键位置（只在 voice_key 留空时用）：留空=按控件名自动找；"box"=按住输入框；
+    # "win:x,y"=窗口左上角起算；"1192,1110"=屏幕绝对坐标
+    voice_button: str = ""
+
     # ---- 识图 ----
     vision_enabled: bool = True
     vision_model: str = "deepseek-flash"   # DeepSeek 唯一支持图片输入的模型
@@ -231,6 +248,31 @@ def config_from_dict(data: dict, env=None) -> Config:
     cfg.developer_ids = [str(x) for x in cfg.developer_ids]
     cfg.proactive_ids = [str(x) for x in cfg.proactive_ids]
     cfg.proactive_chance = max(0.0, min(1.0, float(cfg.proactive_chance or 0)))
+    # 语音开关：比例夹到 0~1，字数下限 10（再短没得念），引擎先只认 sapi
+    try:
+        cfg.voice_ratio = max(0.0, min(1.0, float(cfg.voice_ratio)))
+    except (TypeError, ValueError):
+        raise ValueError("voice_ratio 必须是 0~1 的小数（1 表示满足条件的都发语音）") from None
+    try:
+        cfg.voice_max_chars = max(10, int(cfg.voice_max_chars))
+    except (TypeError, ValueError):
+        raise ValueError("voice_max_chars 必须是整数（建议 30~80）") from None
+    cfg.voice_engine = str(cfg.voice_engine or "auto").strip().lower()
+    if cfg.voice_engine not in ("auto", "breeze", "edge", "winrt", "powershell", "sapi"):
+        raise ValueError("voice_engine 只能是 auto / breeze / edge / winrt / powershell / sapi")
+    try:
+        cfg.voice_rate = max(-50, min(50, int(cfg.voice_rate)))
+        cfg.voice_pitch = max(-50, min(50, int(cfg.voice_pitch)))
+    except (TypeError, ValueError):
+        raise ValueError("voice_rate / voice_pitch 是百分比整数（-50~50）") from None
+    cfg.voice_name = str(cfg.voice_name or "").strip()
+    cfg.voice_breeze_key = str(cfg.voice_breeze_key or "").strip()
+    cfg.voice_breeze_voice = str(cfg.voice_breeze_voice or "").strip()
+    cfg.voice_device = str(cfg.voice_device or "").strip()
+    cfg.voice_key = str(cfg.voice_key or "").strip().lower()
+    if cfg.voice_key not in ("", "alt_r", "alt_l", "ctrl_r", "ctrl_l", "shift_r", "shift_l"):
+        raise ValueError("voice_key 只能填右/左 Alt、Ctrl、Shift（如 alt_r）；留空=用鼠标模式")
+    cfg.voice_button = str(cfg.voice_button or "").strip()
     cfg.wx_account = str(cfg.wx_account or "").strip()
     # 句柄允许写成十进制数字或 "0x1a2b" 字符串
     raw_hwnd = cfg.wx_hwnd
@@ -406,6 +448,66 @@ def clean_reply(text: str) -> str:
     out = "\n".join(line.rstrip() for line in out.split("\n"))
     out = re.sub(r"\n{3,}", "\n\n", out)
     return out.strip()
+
+
+# ────────────────────────────── 语音 ──────────────────────────────
+
+# 念出来只需要「汉字/字母/数字/基本标点」，其余（颜文字、表情、括号、符号）都去掉：
+# TTS 会把 (*^▽^*) 念成「左括号星号脱字符…」，一条回复瞬间变成天书。
+_SPEAK_DROP = re.compile(
+    r"[^\u4e00-\u9fff\u3400-\u4dbf"
+    r"A-Za-z0-9"
+    r"，。！？、；：,.!?;: …"
+    r"]+"
+)
+_SPEAK_PAUSE = "。！？…，"
+
+
+def speakable(text: str, limit: Optional[int] = None) -> str:
+    """把一条聊天回复改写成「念出来也自然」的句子。
+
+    - 换行 → 「，」（真人说话不会突然换行停顿）
+    - 颜文字 / 表情 / 括号 / 符号 → 删掉（TTS 会逐个念出来）
+    - 连续标点收成一个，首尾多余标点去掉，结尾补句号（不然语调是平的）
+    - ``limit`` 有值时按句读截断，尽量不把半句话念出去
+    """
+    raw = str(text or "")
+    if not raw:
+        return ""
+    s = raw.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"\n+", "，", s)
+    s = _SPEAK_DROP.sub("", s)
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[，,、；;]{2,}", "，", s)
+    s = re.sub(r"([。.！!？?])\1+", r"\1", s)   # ？？？ → ？，别把语气改成句号
+    s = re.sub(r"\s*([，。！？、；：…])\s*", r"\1", s)   # 标点旁边的空格念不出来，去掉
+    s = s.strip(" ，,。.、；;：:")
+    if not s or not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", s):
+        return ""    # 只剩标点（「！！！」「……」）没什么可念的
+    if limit and limit > 0 and len(s) > limit:
+        cut = max(s.rfind(ch, 0, limit) for ch in _SPEAK_PAUSE)
+        s = s[: cut + 1] if cut >= limit * 0.5 else s[:limit]
+        s = s.rstrip(" ，,、；;")
+    if s and s[-1] not in "。！？…":
+        s += "。"
+    return s
+
+
+def should_voice(text: str, cfg: Config, roll: Optional[float] = None) -> bool:
+    """这条回复要不要发语音。
+
+    三个条件同时满足才发：开关开着、念出来不超过 ``voice_max_chars``、
+    骰子命中 ``voice_ratio``。``roll`` 是给测试用的固定骰子。
+    """
+    if not cfg.voice_enabled:
+        return False
+    line = speakable(text)
+    if len(line) < 2:
+        return False
+    if len(line) > max(10, int(cfg.voice_max_chars or 60)):
+        return False
+    r = random.random() if roll is None else float(roll)
+    return r < max(0.0, min(1.0, float(cfg.voice_ratio)))
 
 
 @dataclass

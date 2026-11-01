@@ -27,6 +27,8 @@ from brain import (
     config_from_dict,
     decide,
     is_mentioned,
+    should_voice,
+    speakable,
     split_messages,
     split_text,
     strip_mentions,
@@ -639,6 +641,122 @@ class TestConfig(unittest.TestCase):
     def test_bad_wx_hwnd(self):
         with self.assertRaises(ValueError):
             config_from_dict({"wx_hwnd": "不是一个数字"}, env={})
+
+
+class TestSpeakable(unittest.TestCase):
+    """发语音前把回复改写成能念的句子（颜文字会被 TTS 一个个念出来）。"""
+
+    def test_strips_kaomoji(self):
+        self.assertEqual(speakable("好耶！(*^▽^*) 我在的呢"), "好耶！我在的呢。")
+
+    def test_newline_becomes_comma(self):
+        self.assertEqual(speakable("我在的\n刚刚还想跟你说"), "我在的，刚刚还想跟你说。")
+
+    def test_keeps_pause_marks_and_adds_period(self):
+        self.assertEqual(speakable("嗯……你好呀"), "嗯……你好呀。")
+
+    def test_collapses_repeated_punctuation(self):
+        self.assertEqual(speakable("真的吗？？？"), "真的吗？")
+
+    def test_does_not_double_period(self):
+        self.assertEqual(speakable("晚安。"), "晚安。")
+
+    def test_nothing_left(self):
+        for raw in ("", "   ", "！！！", "(*^▽^*)"):
+            self.assertEqual(speakable(raw), "", raw)
+
+    def test_limit_cuts_at_pause(self):
+        line = speakable("今天过得怎么样，我刚才在整理东西呢，等一下再聊", 12)
+        self.assertLessEqual(len(line), 12)
+        self.assertTrue(line.startswith("今天过得怎么样"))
+
+    def test_keeps_plain_sentence(self):
+        raw = "我在电脑里，温柔卖萌底色，偶尔也闹一下。"
+        self.assertEqual(speakable(raw), raw)
+
+
+class TestShouldVoice(unittest.TestCase):
+    """语音开关：关着绝不发；开着也要过「不太长」和概率两道闸。"""
+
+    def _cfg(self, **kw):
+        base = {"voice_enabled": True, "voice_ratio": 1.0, "voice_max_chars": 60}
+        base.update(kw)
+        return config_from_dict(base, env={})
+
+    def test_switch_off_never_voice(self):
+        cfg = self._cfg(voice_enabled=False)
+        self.assertFalse(should_voice("好呀。", cfg, roll=0.0))
+
+    def test_short_reply_goes_voice(self):
+        self.assertTrue(should_voice("好呀。", self._cfg(), roll=0.0))
+
+    def test_ratio_gate(self):
+        cfg = self._cfg(voice_ratio=0.3)
+        self.assertTrue(should_voice("好呀。", cfg, roll=0.1))
+        self.assertFalse(should_voice("好呀。", cfg, roll=0.9))
+
+    def test_long_reply_stays_text(self):
+        cfg = self._cfg(voice_max_chars=10)
+        self.assertFalse(should_voice("这句话太长了，念出来得有十几秒。", cfg, roll=0.0))
+
+    def test_empty_never_voice(self):
+        self.assertFalse(should_voice("！！！", self._cfg(), roll=0.0))
+
+    def test_default_is_off(self):
+        self.assertFalse(config_from_dict({}, env={}).voice_enabled)
+
+
+class TestVoiceConfig(unittest.TestCase):
+    def test_defaults(self):
+        cfg = config_from_dict({}, env={})
+        self.assertFalse(cfg.voice_enabled)
+        self.assertEqual(cfg.voice_engine, "auto")
+        self.assertEqual(cfg.voice_device, "CABLE Input")
+        self.assertEqual(cfg.voice_max_chars, 60)
+        self.assertEqual(cfg.voice_key, "alt_r")
+        self.assertEqual(cfg.voice_rate, 0)
+        self.assertEqual(cfg.voice_pitch, 0)
+
+    def test_rate_pitch_clamped(self):
+        cfg = config_from_dict({"voice_rate": 999, "voice_pitch": -999}, env={})
+        self.assertEqual(cfg.voice_rate, 50)
+        self.assertEqual(cfg.voice_pitch, -50)
+
+    def test_bad_rate_rejected(self):
+        with self.assertRaises(ValueError):
+            config_from_dict({"voice_rate": "快一点"}, env={})
+
+    def test_bad_key_rejected(self):
+        with self.assertRaises(ValueError):
+            config_from_dict({"voice_key": "f13"}, env={})
+
+    def test_key_can_be_cleared(self):
+        """voice_key 留空 = 退回鼠标模式（按住 voice_button 指的位置）。"""
+        self.assertEqual(config_from_dict({"voice_key": ""}, env={}).voice_key, "")
+
+    def test_ratio_clamped(self):
+        self.assertEqual(config_from_dict({"voice_ratio": 5}, env={}).voice_ratio, 1.0)
+        self.assertEqual(config_from_dict({"voice_ratio": -1}, env={}).voice_ratio, 0.0)
+
+    def test_bad_ratio_rejected(self):
+        with self.assertRaises(ValueError):
+            config_from_dict({"voice_ratio": "经常"}, env={})
+
+    def test_bad_engine_rejected(self):
+        with self.assertRaises(ValueError):
+            config_from_dict({"voice_engine": "megaphone"}, env={})
+
+    def test_max_chars_has_floor(self):
+        self.assertEqual(config_from_dict({"voice_max_chars": 1}, env={}).voice_max_chars, 10)
+
+    def test_example_config_has_voice_keys(self):
+        path = pathlib.Path(__file__).with_name("config.example.json")
+        data = json.loads(path.read_text("utf-8"))
+        for key in ("voice_enabled", "voice_ratio", "voice_max_chars",
+                    "voice_engine", "voice_rate", "voice_pitch", "voice_name",
+                    "voice_breeze_key", "voice_breeze_voice",
+                    "voice_device", "voice_key", "voice_button"):
+            self.assertIn(key, data)
 
 
 class _FakeDB:
@@ -2341,6 +2459,13 @@ class TestBotWiring(unittest.TestCase):
         self.assertEqual(imports.get("Listener"), "wechatauto.db")
         self.assertEqual(imports.get("WeChatDB"), "wechatauto.db")
 
+    def test_voice_branch_wired(self):
+        """发语音这条链路容易只改一半：合成好了却没有发送分支。"""
+        src = pathlib.Path(__file__).with_name("wx_bot.py").read_text("utf-8")
+        self.assertIn('kind == "voice"', src)
+        self.assertIn("def _send_voice", src)
+        self.assertIn("def _voice_button_pos", src)
+
 
 class TestMaintenance(unittest.TestCase):
     """日志轮转、识图临时文件清理、dry-run 不写真实记忆。
@@ -2385,6 +2510,41 @@ class TestMaintenance(unittest.TestCase):
         self.assertEqual(prune_images(str(self.dir), keep_days=30, keep_max=4), 6)
         left = sorted(p.name for p in self.dir.glob("*"))
         self.assertEqual(left, ["img0.jpg", "img1.jpg", "img2.jpg", "img3.jpg"])
+
+    def test_prune_voice_by_age(self):
+        """发语音失败留下的 wav：过了保留期要清掉，新的留着。"""
+        from wx_bot import prune_voice
+
+        old = self.dir / "old.wav"
+        old.write_bytes(b"x" * 2000)
+        fresh = self.dir / "fresh.wav"
+        fresh.write_bytes(b"x" * 2000)
+        ts = time.time() - 10 * 86400
+        os.utime(old, (ts, ts))
+        self.assertEqual(prune_voice(str(self.dir), keep_days=3, keep_max=50), 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_prune_voice_drops_empty_files(self):
+        """0 字节的 wav 是合成失败的壳子，不管多新都该删。"""
+        from wx_bot import prune_voice
+
+        empty = self.dir / "empty.wav"
+        empty.write_bytes(b"")
+        self.assertEqual(prune_voice(str(self.dir), keep_days=3, keep_max=50), 1)
+        self.assertFalse(empty.exists())
+
+    def test_image_key_roundtrip(self):
+        """图片密钥要能存下来再读出来（以前从来不落盘，每次重启都重新赌运气）。"""
+        from wx_bot import IMAGE_KEY_FILE, read_saved_image_key, save_image_key
+
+        self.assertEqual(read_saved_image_key(str(self.dir)), "")
+        self.assertTrue(save_image_key(str(self.dir), "0123456789abcdef", 12345))
+        self.assertEqual(read_saved_image_key(str(self.dir)), "0123456789abcdef")
+        self.assertTrue((self.dir / IMAGE_KEY_FILE).exists())
+        # 文件被写坏了也不能抛异常
+        (self.dir / IMAGE_KEY_FILE).write_text("{不是 json", encoding="utf-8")
+        self.assertEqual(read_saved_image_key(str(self.dir)), "")
 
     def test_prune_never_deletes_just_downloaded(self):
         from wx_bot import prune_images
